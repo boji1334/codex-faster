@@ -1,0 +1,116 @@
+# Codex API Key 全功能解锁
+
+一键补丁脚本，使 Codex 桌面应用的 **API Key 模式**拥有与 **ChatGPT 账号登录模式**完全相同的功能。
+
+## 功能解锁清单
+
+| # | 功能 | 说明 |
+|---|------|------|
+| 1 | **Fast/Speed 模式** | 解锁速度选择器 Standard / Fast，默认 Fast |
+| 2 | **模型下拉全显示** | 自动从中转站拉取所有可用模型加入选择列表 |
+| 3 | **Plugins 插件** | API Key 模式可用插件侧边栏和连接器 |
+| 4 | **语音输入/听写** | 扩展为 `chatgpt \|\| apikey` |
+| 5 | **用量/计费设置** | 显示用量和计费页面 |
+| 6 | **i18n 多语言** | 强制启用中文等多语言界面 |
+| 7 | **品牌视觉统一** | 移除 API Key 用户的差异化品牌 |
+
+## 前置要求
+
+- **Node.js**（用于 `npx @electron/asar`）
+- **Python 3**（运行补丁引擎）
+- **Codex 独立安装版**（`.exe` / `.dmg` 安装包，**非 Microsoft Store 版本**）
+
+> 如何确认？如果 Codex 安装在 `%LOCALAPPDATA%\Programs\Codex\`（Windows）或 `/Applications/Codex.app/`（macOS），那就是独立版。如果是 `C:\Program Files\WindowsApps\` 开头，那是 MS Store 版，不支持补丁。
+
+## 一键使用
+
+### Windows
+
+```batch
+patch.bat
+```
+
+或手动执行：
+
+```powershell
+# 关闭 Codex
+taskkill /f /im Codex.exe
+
+# 运行补丁
+python patch.py
+```
+
+### macOS
+
+```bash
+bash patch.sh
+```
+
+或手动执行：
+
+```bash
+pkill -x Codex
+python3 patch.py
+```
+
+## 回滚
+
+```bash
+python3 patch.py --rollback
+```
+
+或手动：
+
+**Windows:**
+```powershell
+cd $env:LOCALAPPDATA\Programs\Codex\resources
+Remove-Item -Recurse -Force app
+Rename-Item app.asar1 app.asar
+```
+
+**macOS:**
+```bash
+cd /Applications/Codex.app/Contents/Resources
+rm -rf app
+mv app.asar1 app.asar
+codesign --force --deep --sign - /Applications/Codex.app
+```
+
+## 效果说明
+
+### Fast 模式加速效果
+
+Fast 模式通过 `service_tier: "priority"` 参数控制推理速度。实际加速效果取决于你的 API 中转站/上游：
+
+- **OpenAI API Key 账号**：原生支持 speed tier → 真实 1.5x 加速
+- **ChatGPT Plus OAuth 账号**：通过 sub2api 等平台中转时，需在平台配置 "OpenAI Fast/Flex Policy" 规则为 `Pass` 模式
+- **其他第三方代理**：取决于代理是否支持透传 `service_tier` 参数
+
+> 已配置 sub2api 的用户：登录管理面板 → 设置 → OpenAI Fast/Flex 策略 → 添加规则（service_tier=priority, 动作=Pass, 范围=全部账号）
+
+### 模型可用性
+
+脚本会自动从中转站 `/v1/models` 拉取模型列表并注入 Codex。哪些模型能用取决于中转站上游的实际支持情况。
+
+### 更新后重跑
+
+Codex 更新会覆盖 `app.asar`，补丁失效。更新后重新运行脚本即可恢复所有功能。脚本支持重复运行——已应用的补丁会自动跳过。
+
+## 原理
+
+| 操作 | 原因 |
+|------|------|
+| 提取 + 重命名 app.asar | 让 Electron 从解包目录加载修改后的 JS |
+| 修改 webview JS 文件 | 绕过 `authMethod !== chatgpt` 门控 |
+| 注入 models_cache.json | 扩展模型选择列表 |
+| 补全 config.toml features | 启用 fast/speed/pro/deep research 等特性 |
+| 禁用 Electron fuses | 关闭 asar 完整性校验 |
+| macOS 重新签名 | macOS Gatekeeper 拒绝未签名应用 |
+
+## 免责声明
+
+本项目仅供学习和研究目的。使用本脚本可能违反 OpenAI 的服务条款。使用者自行承担风险。
+
+## License
+
+MIT

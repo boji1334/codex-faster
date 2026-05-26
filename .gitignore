@@ -1,0 +1,8 @@
+__MACOSX/
+codex-extract/
+fast_search.py
+inject_models.py
+*.pyc
+__pycache__/
+.DS_Store
+*.bak
