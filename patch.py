@@ -263,8 +263,8 @@ def patch_module_2_plugins_i18n():
             name="i18n 多语言强制启用",
             find_str=None,
             replace_str=None,
-            find_regex=r'([a-zA-Z_$])=\(0,[a-zA-Z_$]+\.useMemo\)\(\(\)=>[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\),\[[a-zA-Z_$]+\]\)',
-            replace_fn=lambda m: f"{m.group(1)}=(0,Q.useMemo)(()=>!0,[n])"
+            find_regex=r'([a-zA-Z_$])=\(0,([a-zA-Z_$]+)\.useMemo\)\(\(\)=>[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\),\[([a-zA-Z_$]+)\]\)',
+            replace_fn=lambda m: f"{m.group(1)}=(0,{m.group(2)}.useMemo)(()=>!0,[{m.group(3)}])"
         )
 
 
@@ -455,14 +455,24 @@ def patch_module_7_frontend_models():
 
     find_str = 'select:({data:r})=>{let i=[],a=new Set(e),o=null;return r.forEach(e=>{if(d?a.has(e.model):!e.hidden){let n=t===`copilot`?[e.supportedReasoningEfforts.find(e=>e.reasoningEffort===`medium`)??{reasoningEffort:`medium`,description:`medium effort`}]:[...e.supportedReasoningEfforts];i.push({...e,supportedReasoningEfforts:n}),e.isDefault&&(o=e)}}),o??=i.find(e=>e.model===n)??null,{models:i,defaultModel:o}}'
     
-    replace_str = f'select:({{data:r}})=>{{let i=[];r.forEach(e=>{{i.push({{...e,hidden:false,supportedReasoningEfforts:[...e.supportedReasoningEfforts]}})}});let extraModels={js_array_str};let template=i[0];if(template){{extraModels.forEach(m=>{{if(!i.some(exist=>exist.model===m)){{let newModel={{...template}};for(let key in newModel){{if(typeof newModel[key]==="string"){{if(newModel[key]===template.model||newModel[key]===template.slug){{newModel[key]=m}}else if(newModel[key]===template.displayName||newModel[key]===template.display_name||newModel[key]===`GPT-5.5`){{newModel[key]=m.replace(/-/g," ").replace(/\\b\\w/g,c=>c.toUpperCase())}}}};newModel.model=m;newModel.slug=m;newModel.display_name=m.replace(/-/g," ").replace(/\\b\\w/g,c=>c.toUpperCase());newModel.displayName=newModel.display_name;newModel.isDefault=false;i.push(newModel)}})}});return {{models:i,defaultModel:i.find(e=>e.model===n)||i[0]||null}}'
+    # 精确替换字符串（已知特定版本，变量名固定为 r/n）
+    replace_str = f'select:({{data:r}})=>{{let i=[];r.forEach(e=>{{i.push({{...e,hidden:false,supportedReasoningEfforts:[...e.supportedReasoningEfforts]}})}});let extraModels={js_array_str};let template=i[0];if(template){{extraModels.forEach(m=>{{if(!i.some(exist=>exist.model===m)){{let newModel={{...template}};for(let key in newModel){{if(typeof newModel[key]===\"string\"){{if(newModel[key]===template.model||newModel[key]===template.slug){{newModel[key]=m}}else if(newModel[key]===template.displayName||newModel[key]===template.display_name||newModel[key]===`GPT-5.5`){{newModel[key]=m.replace(/-/g,\" \").replace(/\\b\\w/g,c=>c.toUpperCase())}}}};newModel.model=m;newModel.slug=m;newModel.display_name=m.replace(/-/g,\" \").replace(/\\b\\w/g,c=>c.toUpperCase());newModel.displayName=newModel.display_name;newModel.isDefault=false;i.push(newModel)}})}})}});return {{models:i,defaultModel:i.find(e=>e.model===n)||i[0]||null}}'
 
     # 超强鲁棒性正则模糊匹配，防止未来混淆变量名发生改变
-    find_regex = r'select\s*:\s*\(\{\s*data\s*:\s*([a-zA-Z_$]+)\s*\}\)\s*=>\s*\{.*?defaultModel\s*:\s*[a-zA-Z_$]+\s*\}\}'
+    find_regex = r'select\s*:\s*\(\{\s*data\s*:\s*([a-zA-Z_$]+)\s*\}\)\s*=>\s*\{.*?i\.find\(e=>e\.model===([a-zA-Z_$]+)\).*?defaultModel\s*:\s*[a-zA-Z_$]+\s*\}\}'
     
     def replace_fn(m):
         data_var = m.group(1)
-        return f'select:({{data:{data_var}}})=>{{let i=[];{data_var}.forEach(e=>{{i.push({{...e,hidden:false,supportedReasoningEfforts:[...e.supportedReasoningEfforts]}})}});let extraModels={js_array_str};let template=i[0];if(template){{extraModels.forEach(m=>{{if(!i.some(exist=>exist.model===m)){{let newModel={{...template}};for(let key in newModel){{if(typeof newModel[key]==="string"){{if(newModel[key]===template.model||newModel[key]===template.slug){{newModel[key]=m}}else if(newModel[key]===template.displayName||newModel[key]===template.display_name||newModel[key]===`GPT-5.5`){{newModel[key]=m.replace(/-/g," ").replace(/\\b\\w/g,c=>c.toUpperCase())}}}};newModel.model=m;newModel.slug=m;newModel.display_name=m.replace(/-/g," ").replace(/\\b\\w/g,c=>c.toUpperCase());newModel.displayName=newModel.display_name;newModel.isDefault=false;i.push(newModel)}})}});return {{models:i,defaultModel:i.find(e=>e.model===n)||i[0]||null}}'
+        default_var = m.group(2)  # 从原始代码捕获默认模型变量名，不硬编码
+        # 从 replace_str 派生，只替换变量名，确保 JS 结构与精确匹配版本完全一致
+        out = replace_str
+        out = out.replace('({data:r})', '({data:' + data_var + '})')
+        out = out.replace('r.forEach', data_var + '.forEach')
+        # rfind 替换最后一个 ===n) ，对应 defaultModel 变量
+        last_idx = out.rfind('===n)')
+        if last_idx >= 0:
+            out = out[:last_idx] + '===' + default_var + ')' + out[last_idx + 5:]
+        return out
 
     for filepath in files:
         basename = os.path.basename(filepath)
@@ -675,7 +685,7 @@ def main():
         print("\n[准备] 提取 app.asar...")
         import subprocess
         result = subprocess.run(
-            ["npx", "@electron/asar", "e", asar_path, app_dir],
+            ["npx", "-y", "@electron/asar", "e", asar_path, app_dir],  # -y 防止首次运行时卡在包安装确认
             capture_output=True, text=True, timeout=120
         )
         if result.returncode != 0:
@@ -757,6 +767,47 @@ def rollback():
         shutil.copy2(models_bak, MODELS_CACHE)
         os.chmod(MODELS_CACHE, stat.S_IREAD | stat.S_IWRITE)
         print("  已恢复 models_cache.json")
+
+    # 恢复 Electron fuse（将被关掉的安全开关重新打开，让 Codex.exe 回到出厂状态）
+    import subprocess
+    print("\n  恢复 Electron 安全熔断器...")
+
+    # 定位 Codex.exe
+    codex_exe = None
+    if PLATFORM == "windows":
+        for name in ["Codex.exe", "codex.exe"]:
+            candidate = os.path.join(os.path.dirname(CODEX_RESOURCES), name)
+            if os.path.isfile(candidate):
+                codex_exe = candidate
+                break
+    elif PLATFORM == "macos":
+        codex_exe = "/Applications/Codex.app"
+
+    if not codex_exe:
+        print("  [WARN] 未找到 Codex 可执行文件，跳过 fuse 恢复。")
+        print("         请手动执行: npx -y @electron/fuses write --app <Codex路径> OnlyLoadAppFromAsar=on")
+    else:
+        fuses_to_restore = [
+            "OnlyLoadAppFromAsar=on",
+            "EnableEmbeddedAsarIntegrityValidation=on",
+            "GrantFileProtocolExtraPrivileges=on",
+            "EnableCookieEncryption=on",
+        ]
+        fuse_ok = True
+        for fuse in fuses_to_restore:
+            r = subprocess.run(
+                ["npx", "-y", "@electron/fuses", "write", "--app", codex_exe, fuse],
+                capture_output=True, text=True
+            )
+            if r.returncode != 0:
+                print(f"  [WARN] fuse {fuse} 恢复失败（可能需要管理员权限）")
+                print(f"         {r.stderr.strip()}")
+                fuse_ok = False
+            else:
+                print(f"  [OK]   {fuse}")
+        if not fuse_ok:
+            print("  [HINT] 请以管理员身份重新运行: python patch.py --rollback")
+
     print("回滚完成。")
 
 

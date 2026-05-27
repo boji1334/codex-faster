@@ -53,6 +53,8 @@ set "CODEX_FOUND="
 for %%d in (
     "%LOCALAPPDATA%\Programs\Codex"
     "%LOCALAPPDATA%\Codex"
+    "%LOCALAPPDATA%\CodexStandalone"
+    "%LOCALAPPDATA%\CodexPatched"
     "C:\Program Files\Codex"
     "%LOCALAPPDATA%\OpenAI\Codex"
 ) do (
@@ -102,10 +104,14 @@ if %PATCH_RESULT% equ 0 (
     set "CODEX_EXE=!CODEX_FOUND!\Codex.exe"
     if not exist "!CODEX_EXE!" set "CODEX_EXE=!CODEX_FOUND!\codex.exe"
 
-    npx @electron/fuses write --app "!CODEX_EXE!" OnlyLoadAppFromAsar=off 2>nul
-    npx @electron/fuses write --app "!CODEX_EXE!" EnableEmbeddedAsarIntegrityValidation=off 2>nul
-    npx @electron/fuses write --app "!CODEX_EXE!" GrantFileProtocolExtraPrivileges=off 2>nul
-    npx @electron/fuses write --app "!CODEX_EXE!" EnableCookieEncryption=off 2>nul
+    npx -y @electron/fuses write --app "!CODEX_EXE!" OnlyLoadAppFromAsar=off
+    if !errorlevel! neq 0 echo [WARN] fuse OnlyLoadAppFromAsar 设置失败，Codex 可能无法加载修改后的文件，请以管理员身份重试。
+    npx -y @electron/fuses write --app "!CODEX_EXE!" EnableEmbeddedAsarIntegrityValidation=off
+    if !errorlevel! neq 0 echo [WARN] fuse EnableEmbeddedAsarIntegrityValidation 设置失败，请以管理员身份重试。
+    npx -y @electron/fuses write --app "!CODEX_EXE!" GrantFileProtocolExtraPrivileges=off
+    if !errorlevel! neq 0 echo [WARN] fuse GrantFileProtocolExtraPrivileges 设置失败。
+    npx -y @electron/fuses write --app "!CODEX_EXE!" EnableCookieEncryption=off
+    if !errorlevel! neq 0 echo [WARN] fuse EnableCookieEncryption 设置失败。
     echo       完成
 )
 

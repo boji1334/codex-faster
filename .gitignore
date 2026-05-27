@@ -1,7 +1,7 @@
 __MACOSX/
 codex-extract/
 fast_search.py
-inject_models.py
+# inject_models.py  # removed from ignore: private domain and hardcoded path fixed, now safe to track
 *.pyc
 __pycache__/
 .DS_Store
