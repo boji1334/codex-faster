@@ -200,8 +200,15 @@ def detect_platform():
                     if CODEX_RESOURCES:
                         break
         if not CODEX_RESOURCES:
+            # 最后尝试：检测 Microsoft Store 版并自动转换为独立版
+            store_res = _convert_store_to_standalone()
+            if store_res:
+                CODEX_RESOURCES = store_res
+        if not CODEX_RESOURCES:
             print("[ERROR] 未找到 Codex 安装目录。")
-            print("  请确认 Codex 已通过独立安装包安装（非 Microsoft Store 版）。")
+            print("  请确认 Codex 已安装（可从 Microsoft Store 搜索 'Codex' 安装）。")
+            print("  如果已安装 Store 版，请以管理员身份运行本脚本，")
+            print("  脚本会自动将 Store 版复制为可打补丁的独立版。")
             print("  或用 CODEX_PATH 环境变量指定，例如:")
             print('    set CODEX_PATH=D:\\Codex && python patch.py')
             sys.exit(1)
@@ -263,6 +270,88 @@ def _find_codex_executable(install_root):
                 return os.path.join(install_root, f)
     except OSError:
         pass
+    return None
+
+
+def _convert_store_to_standalone():
+    """检测 Microsoft Store 版 Codex，将其复制为独立版供补丁使用。
+
+    纯本地操作：只是把用户电脑上已有的 Store 版文件复制到
+    %LOCALAPPDATA%\\CodexStandalone\\，不联网、不下载任何东西。
+    需要管理员权限（读取 WindowsApps 目录）。
+    返回独立版的 resources 路径，失败返回 None。"""
+    if sys.platform != "win32":
+        return None
+
+    win_apps = os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"), "WindowsApps")
+    if not os.path.isdir(win_apps):
+        return None
+
+    # Store 版目录名格式: OpenAI.Codex_<version>_x64__<publisherhash>
+    # 或 OpenAI.ChatGPTDesktop (早期名称)
+    store_dir = None
+    try:
+        for d in os.listdir(win_apps):
+            dl = d.lower()
+            if ("openai" in dl and "codex" in dl) or "9plm9xgg6vks" in dl:
+                candidate = os.path.join(win_apps, d)
+                # 确认里面有 app.asar 或 resources 目录
+                res = os.path.join(candidate, "resources")
+                if os.path.isfile(os.path.join(res, "app.asar")):
+                    store_dir = candidate
+                    break
+                # 有些 Store 包 app.asar 直接在根目录
+                if os.path.isfile(os.path.join(candidate, "app.asar")):
+                    store_dir = candidate
+                    break
+    except PermissionError:
+        print("\n[INFO] 检测到 Microsoft Store 版 Codex，但无权限读取 WindowsApps 目录。")
+        print("       请以管理员身份运行本脚本（右键 patch.bat → 以管理员身份运行）。")
+        return None
+    except OSError:
+        return None
+
+    if not store_dir:
+        return None
+
+    # 找到了 Store 版，提示用户并复制
+    print(f"\n[INFO] 检测到 Microsoft Store 版 Codex:")
+    print(f"       {store_dir}")
+    print(f"       Store 版受系统沙箱保护，无法直接打补丁。")
+    print(f"       正在将其复制为独立版（纯本地操作，不联网）...")
+
+    standalone_root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "CodexStandalone")
+    standalone_res = os.path.join(standalone_root, "resources")
+
+    # 如果已经复制过且 resources 里有 app.asar，跳过复制
+    if _resources_has_app(standalone_res):
+        print(f"       独立版已存在: {standalone_root}，跳过复制。")
+        return standalone_res
+
+    # 执行复制
+    try:
+        print(f"       目标: {standalone_root}")
+        print(f"       复制中（约 200-300MB，请稍候）...")
+        shutil.copytree(store_dir, standalone_root, dirs_exist_ok=True)
+        print(f"       [OK] 复制完成。")
+    except PermissionError:
+        print(f"       [ERROR] 无权限复制。请以管理员身份运行。")
+        return None
+    except Exception as e:
+        print(f"       [ERROR] 复制失败: {e}")
+        return None
+
+    # 确认复制后的 resources 路径
+    if _resources_has_app(standalone_res):
+        return standalone_res
+    # 有些结构 app.asar 直接在根目录，resources 不存在
+    if os.path.isfile(os.path.join(standalone_root, "app.asar")):
+        # 创建 resources 子目录结构
+        os.makedirs(standalone_res, exist_ok=True)
+        shutil.move(os.path.join(standalone_root, "app.asar"), os.path.join(standalone_res, "app.asar"))
+        return standalone_res
+
+    print(f"       [ERROR] 复制后未找到 app.asar，Store 版结构可能不兼容。")
     return None
 
 

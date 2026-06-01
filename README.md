@@ -25,9 +25,9 @@
 ## 关于 Codex 下载来源
 
 - **macOS：** 官方提供独立 dmg —— [`Codex.dmg`](https://persistent.oaistatic.com/codex-app-prod/Codex.dmg)（拖到 Applications 即可）。这就是支持的"独立版"。
-- **Windows：** OpenAI 官网"下载 Windows 版"按钮目前直接跳转 Microsoft Store。**Store 版受系统沙箱保护，本脚本无法对其打补丁**。如果你已经从 Store 装了 Codex，需要先卸载，然后从社区维护的"重打包独立版"安装（这类项目把 Codex 重新打包成普通 Electron 应用，常见安装位置是 `%LOCALAPPDATA%\CodexStandalone\` 或 `%LOCALAPPDATA%\Programs\Codex\`）。社区项目示例：[aidanqm/Codex-Windows](https://github.com/aidanqm/Codex-Windows)、[Haleclipse/CodexDesktop-Rebuild](https://github.com/Haleclipse/CodexDesktop-Rebuild)。注意它们是第三方重打包，请自行评估风险。
+- **Windows：** OpenAI 官网"下载 Windows 版"按钮目前直接跳转 Microsoft Store。**Store 版受系统沙箱保护，无法直接打补丁——但本脚本会自动处理**：检测到 Store 版时，会自动将其复制为可打补丁的独立版（纯本地操作，不联网），只需以管理员身份运行即可。所以 Windows 用户直接从 Store 装 Codex 就行，脚本会搞定剩下的。
 
-> **本脚本不会自动下载安装 Node.js、Python 或 Codex。** 这些都需要你手动备齐——脚本只在已安装好的环境上打补丁。运行时如果检测到缺 Node.js，会给出对应系统的安装命令提示（`winget` / `brew` / `apt` 等），但仍由你自行执行。
+> **本脚本不会自动下载安装 Node.js、Python 或 Codex。** Node.js 和 Python 需要你手动备齐（运行时如果检测到缺 Node.js，会给出对应系统的安装命令提示）。Codex 本身请从 Microsoft Store 搜索安装（Windows）或用官方 dmg（macOS）。
 
 ## 一键使用
 
