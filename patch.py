@@ -1043,6 +1043,52 @@ def print_report():
 # ================================================================
 # 主流程
 # ================================================================
+def check_prerequisites():
+    """检查必备依赖（Node.js + Python 3）。
+    只检测、给出对应系统的安装命令提示，不自动下载/执行——影响系统的操作必须由用户决定。
+    返回 True 表示依赖齐全可继续，False 表示缺失（main 中会退出）。"""
+    print("\n[环境检查] 检测前置依赖...")
+    missing = []
+
+    # Node.js（npx 是它的一部分）
+    npx_path = resolve_executable("npx")
+    if npx_path:
+        print(f"  [OK]   Node.js (npx): {npx_path}")
+    else:
+        print("  [缺]   Node.js (未找到 npx)")
+        missing.append("node")
+
+    # Python 自身已经在跑，但提示 3.x（兼容性参考）
+    py_ver = "{}.{}".format(sys.version_info.major, sys.version_info.minor)
+    print(f"  [OK]   Python: {py_ver} ({sys.executable})")
+
+    if not missing:
+        print("  依赖齐全，继续。")
+        return True
+
+    # 给对应系统的安装命令提示（不自动执行）
+    print("\n[ERROR] 缺少必要依赖，无法继续。请按以下命令自行安装后重试：\n")
+    if "node" in missing:
+        print("  Node.js 安装方式（任选其一）：")
+        if sys.platform == "win32":
+            print("    1) 用 winget（Windows 10/11 自带）：")
+            print("       winget install OpenJS.NodeJS.LTS")
+            print("    2) 用 Chocolatey：")
+            print("       choco install nodejs-lts")
+            print("    3) 直接下载安装包：https://nodejs.org/en/download")
+        elif sys.platform == "darwin":
+            print("    1) 用 Homebrew：")
+            print("       brew install node")
+            print("    2) 直接下载安装包：https://nodejs.org/en/download")
+        else:  # linux
+            print("    Debian/Ubuntu:  sudo apt install nodejs npm")
+            print("    Fedora/RHEL:    sudo dnf install nodejs")
+            print("    Arch:           sudo pacman -S nodejs npm")
+            print("    或下载安装包：  https://nodejs.org/en/download")
+        print("\n  提示：本脚本不会自动安装系统依赖，以上命令需要你手动执行。")
+    return False
+
+
 def kill_codex():
     """关闭正在运行的 Codex 进程，避免文件被占用导致补丁失败（跨平台）。"""
     try:
@@ -1086,6 +1132,10 @@ def main():
     print("=" * 60)
     print("  Codex API Key 全功能解锁 v2.0")
     print("=" * 60)
+
+    # 0. 前置依赖检查（缺 Node.js 直接退出，给出对应系统的安装命令）
+    if not check_prerequisites():
+        sys.exit(1)
 
     detect_platform()
     kill_codex()
