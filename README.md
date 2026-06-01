@@ -33,28 +33,48 @@
 
 `patch.py` 现在是**自包含的跨平台引擎**：自动关闭 Codex 进程、查找安装目录、解包、打补丁、写 Electron fuse，macOS 上还会自动重新签名。一条命令即可，无需手动执行额外步骤。
 
-### Windows
+### 完整流程（Windows 用户，从零开始）
+
+```
+前提：安装 Node.js（https://nodejs.org）和 Python 3（https://python.org）
+      从 Microsoft Store 搜索 "Codex" 安装（或已经装了）
+```
+
+**操作步骤：**
+
+1. 右键 `patch.bat` → **以管理员身份运行**
+2. 等待窗口显示 `Done`（首次约 1-2 分钟，含复制文件和下载 npm 工具包）
+3. 按任意键关闭窗口
+4. 双击桌面上新出现的 **"Codex (Patched)"** 图标
+5. 用 API Key 模式登录，功能全解锁
+
+**脚本自动完成的事（无需手动操作）：**
+
+| 步骤 | 说明 |
+|------|------|
+| 环境检查 | 检测 Node.js / Python，缺失则给出安装命令 |
+| 查找 Codex | 优先找独立版；只有 Store 版则自动复制为独立版 |
+| 关闭进程 | 自动 taskkill Codex.exe |
+| 解包 | npx @electron/asar 提取 app.asar |
+| 打补丁 | 12 个功能解锁补丁（regex 兼容多版本） |
+| 语法校验 | node --check 验证所有改动文件，出错自动回滚 |
+| 写 Fuse | 禁用 Electron 安全检查（带重试，不怕文件占用） |
+| 桌面快捷方式 | 自动创建 "Codex (Patched)" 快捷方式 |
+
+> **为什么需要管理员权限？** Store 版 Codex 装在受保护的 `WindowsApps` 目录，需要管理员权限才能读取并复制。如果你已有独立版（非 Store），普通权限即可。
+
+### Windows（已有独立版）
+
+不需要管理员，直接双击：
 
 ```batch
 patch.bat
-```
-
-或直接运行（自动检测安装位置）：
-
-```powershell
-python patch.py
 ```
 
 ### macOS / Linux
 
 ```bash
 bash patch.sh
-```
-
-或直接运行：
-
-```bash
-python3 patch.py
 ```
 
 ### 安装在非标准位置？

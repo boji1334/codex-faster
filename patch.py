@@ -1178,6 +1178,59 @@ def check_prerequisites():
     return False
 
 
+def create_desktop_shortcut():
+    """在桌面创建 'Codex (Patched)' 快捷方式，指向补丁版 Codex.exe。
+    仅 Windows 生效（macOS/Linux 用户直接从 Applications 或命令行启动）。
+    使用 PowerShell COM 对象创建 .lnk，不依赖第三方库。"""
+    if sys.platform != "win32" or not CODEX_APP:
+        return
+
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    if not os.path.isdir(desktop):
+        # 有些系统桌面路径不同，尝试 shell:desktop
+        try:
+            r = subprocess.run(
+                ["powershell", "-Command", "[Environment]::GetFolderPath('Desktop')"],
+                capture_output=True, text=True, timeout=10
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                desktop = r.stdout.strip()
+        except Exception:
+            pass
+    if not os.path.isdir(desktop):
+        return
+
+    shortcut_path = os.path.join(desktop, "Codex (Patched).lnk")
+
+    # 如果快捷方式已存在，跳过
+    if os.path.isfile(shortcut_path):
+        print(f"\n  桌面快捷方式已存在: Codex (Patched)")
+        return
+
+    # 用 PowerShell 创建 .lnk 快捷方式
+    ps_script = f'''
+$ws = New-Object -ComObject WScript.Shell
+$sc = $ws.CreateShortcut("{shortcut_path}")
+$sc.TargetPath = "{CODEX_APP}"
+$sc.WorkingDirectory = "{os.path.dirname(CODEX_APP)}"
+$sc.Description = "Codex (API Key Patched)"
+$sc.Save()
+'''
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=15
+        )
+        if r.returncode == 0:
+            print(f"\n  桌面快捷方式已创建: Codex (Patched)")
+        else:
+            print(f"\n  [WARN] 创建桌面快捷方式失败: {r.stderr.strip()}")
+            print(f"         你可以手动创建快捷方式指向: {CODEX_APP}")
+    except Exception as e:
+        print(f"\n  [WARN] 创建桌面快捷方式异常: {e}")
+        print(f"         你可以手动创建快捷方式指向: {CODEX_APP}")
+
+
 def kill_codex():
     """关闭正在运行的 Codex 进程，避免文件被占用导致补丁失败（跨平台）。"""
     try:
@@ -1314,6 +1367,9 @@ def main():
     if not syntax_ok:
         print("\n  [注意] 部分补丁因语法问题已自动回退，对应功能未生效，")
         print("         但 Codex 可正常启动。请把上方 [FAIL] 信息反馈以便修复。")
+
+    # 创建桌面快捷方式（Windows），方便用户启动补丁版 Codex
+    create_desktop_shortcut()
 
     print(f"\n  Codex 全功能解锁完成。启动 Codex 使用 API key 模式登录即可。")
     print(f"  如需回滚，运行: python3 patch.py --rollback\n")
