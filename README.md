@@ -24,34 +24,51 @@
 
 ## 一键使用
 
+`patch.py` 现在是**自包含的跨平台引擎**：自动关闭 Codex 进程、查找安装目录、解包、打补丁、写 Electron fuse，macOS 上还会自动重新签名。一条命令即可，无需手动执行额外步骤。
+
 ### Windows
 
 ```batch
 patch.bat
 ```
 
-或手动执行：
+或直接运行（自动检测安装位置）：
 
 ```powershell
-# 关闭 Codex
-taskkill /f /im Codex.exe
-
-# 运行补丁
 python patch.py
 ```
 
-### macOS
+### macOS / Linux
 
 ```bash
 bash patch.sh
 ```
 
-或手动执行：
+或直接运行：
 
 ```bash
-pkill -x Codex
 python3 patch.py
 ```
+
+### 安装在非标准位置？
+
+脚本会自动搜索常见安装目录。如果你的 Codex 装在别处（或自动检测失败），用 `CODEX_PATH` 指定即可——支持安装根目录、`resources` 目录，或 macOS 的 `.app` 路径：
+
+```powershell
+# Windows
+set CODEX_PATH=D:\MyApps\Codex
+python patch.py
+```
+
+```bash
+# macOS
+CODEX_PATH=/Applications/Codex.app python3 patch.py
+
+# Linux
+CODEX_PATH=/opt/Codex python3 patch.py
+```
+
+也可以用命令行参数：`python patch.py --path "D:\MyApps\Codex"`
 
 ## 回滚
 
@@ -106,10 +123,6 @@ Codex 更新会覆盖 `app.asar`，补丁失效。更新后重新运行脚本即
 | 补全 config.toml features | 启用 fast/speed/pro/deep research 等特性 |
 | 禁用 Electron fuses | 关闭 asar 完整性校验 |
 | macOS 重新签名 | macOS Gatekeeper 拒绝未签名应用 |
-
-## 免责声明
-
-本项目仅供学习和研究目的。使用本脚本可能违反 OpenAI 的服务条款。使用者自行承担风险。
 
 ## License
 

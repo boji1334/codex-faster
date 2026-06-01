@@ -5,15 +5,16 @@ Codex API Key 全功能解锁 — 一键补丁引擎
 支持版本自动发现，当 Codex 更新后文件名 hash 变化时自动定位目标文件。
 """
 
-import os, glob, re, sys, json, shutil, stat, urllib.request
+import os, glob, re, sys, json, shutil, stat, subprocess, time, urllib.request
 from pathlib import Path
 
 # ================================================================
 # 配置
 # ================================================================
-PLATFORM = None  # "macos" | "windows" — auto-detected
+PLATFORM = None  # "macos" | "windows" | "linux" — auto-detected
 BASE = None       # webview/assets 路径
 CODEX_RESOURCES = None
+CODEX_APP = None  # @electron/fuses 的目标：macOS 为 .app，其它平台为可执行文件
 API_BASE_URL = None
 API_KEY = None
 USER_HOME = os.path.expanduser("~")
@@ -21,50 +22,215 @@ CONFIG_PATH = os.path.join(USER_HOME, ".codex", "config.toml")
 MODELS_CACHE = os.path.join(USER_HOME, ".codex", "models_cache.json")
 
 results = {"applied": [], "skipped": [], "failed": []}
+patched_files = set()  # 记录真正被写入修改过的 JS 文件，用于补丁后语法校验
+
+
+# ================================================================
+# 跨平台命令解析：让 npx / codesign 在任何机器上都能被正确调用
+# ================================================================
+def resolve_executable(name):
+    """在 PATH 中解析可执行文件的绝对路径。
+
+    Windows 上 npx 实际是 npx.cmd / npx.ps1，直接用 subprocess(["npx", ...])
+    会抛 FileNotFoundError，因此必须显式解析后缀。返回 None 表示未安装。
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    if sys.platform == "win32":
+        for ext in (".cmd", ".exe", ".bat", ".ps1"):
+            found = shutil.which(name + ext)
+            if found:
+                return found
+    return None
+
+
+def run_command(args, **kwargs):
+    """运行外部命令。自动解析可执行文件路径，跨平台安全。
+
+    关键点：Windows 上 npx / @electron 等工具是 .cmd/.bat 批处理脚本。
+    不同 Python 版本对“用 subprocess 列表参数直接执行 .cmd”的支持不一致
+    （3.7 及更早版本可能失败，且涉及 CVE-2024-3566 的安全修复）。
+    为了在任何机器、任何 Python 版本上都稳定，这里对 .cmd/.bat 显式用
+    `cmd /c` 包裹调用，而不依赖解释器的隐式行为。
+    """
+    exe = resolve_executable(args[0])
+    if exe:
+        if sys.platform == "win32" and exe.lower().endswith((".cmd", ".bat")):
+            # 用 cmd /c 显式执行批处理包装器，跨 Python 版本可靠
+            return subprocess.run(["cmd", "/c", exe] + list(args[1:]), **kwargs)
+        return subprocess.run([exe] + list(args[1:]), **kwargs)
+    # 回退：Windows 下用 shell 解析（处理 PATH 中只有 .cmd 包装器的边缘情况）
+    if sys.platform == "win32":
+        return subprocess.run(" ".join(f'"{a}"' if " " in a else a for a in args),
+                              shell=True, **kwargs)
+    raise FileNotFoundError(args[0])
+
+
+def _windows_codex_candidates():
+    """汇总 Windows 上所有可能的 Codex 安装根目录（不含 resources）。"""
+    cands = []
+    env_dirs = [
+        os.environ.get("LOCALAPPDATA", ""),
+        os.environ.get("PROGRAMFILES", ""),
+        os.environ.get("PROGRAMFILES(X86)", ""),
+        os.environ.get("PROGRAMDATA", ""),
+        os.environ.get("APPDATA", ""),
+    ]
+    sub_dirs = [
+        ["Programs", "Codex"],
+        ["Codex"],
+        ["CodexStandalone"],
+        ["CodexPatched"],
+        ["OpenAI", "Codex"],
+        ["Programs", "@openai", "codex"],
+    ]
+    for base in env_dirs:
+        if not base:
+            continue
+        for parts in sub_dirs:
+            cands.append(os.path.join(base, *parts))
+    return cands
+
+
+def _resources_has_app(rp):
+    """判断某个 resources 目录是否是有效的 Codex 安装（含 app.asar 或已解包/已打补丁）。"""
+    return os.path.isdir(rp) and (
+        os.path.isfile(os.path.join(rp, "app.asar"))
+        or os.path.isfile(os.path.join(rp, "app.asar1"))
+        or os.path.isdir(os.path.join(rp, "app"))
+    )
+
+
+def _user_override_resources():
+    """允许用户通过环境变量或命令行覆盖 Codex 路径，适配非标准安装位置。
+
+    优先级：--path 参数 > CODEX_PATH 环境变量。
+    接受 Codex 根目录、resources 目录，或 macOS 的 .app 目录。
+    """
+    override = None
+    for i, a in enumerate(sys.argv):
+        if a == "--path" and i + 1 < len(sys.argv):
+            override = sys.argv[i + 1]
+        elif a.startswith("--path="):
+            override = a.split("=", 1)[1]
+    if not override:
+        override = os.environ.get("CODEX_PATH")
+    if not override:
+        return None
+
+    p = os.path.abspath(os.path.expanduser(override))
+    # macOS .app 包
+    if p.endswith(".app") and os.path.isdir(p):
+        return os.path.join(p, "Contents", "Resources")
+    # 已经是 resources 目录
+    if os.path.basename(p).lower() == "resources" and _resources_has_app(p):
+        return p
+    # 是安装根目录（含 resources 子目录）
+    rp = os.path.join(p, "resources")
+    if _resources_has_app(rp):
+        return rp
+    # macOS 根目录传了 Codex.app 的父级
+    rp = os.path.join(p, "Contents", "Resources")
+    if _resources_has_app(rp):
+        return rp
+    # 用户直接传了 resources 路径但还没解包
+    if os.path.isdir(p):
+        return p
+    print(f"[WARN] 指定的路径无效或不含 Codex 资源: {override}")
+    return None
 
 
 def detect_platform():
-    global PLATFORM, CODEX_RESOURCES, BASE
+    global PLATFORM, CODEX_RESOURCES, CODEX_APP, BASE
+
+    # 1. 用户显式指定的路径优先（任何平台通用）
+    override = _user_override_resources()
+
     if sys.platform == "darwin":
         PLATFORM = "macos"
-        CODEX_RESOURCES = "/Applications/Codex.app/Contents/Resources"
-    elif sys.platform == "win32":
-        PLATFORM = "windows"
-        local_app = os.environ.get("LOCALAPPDATA", "")
-        # Search common install locations
-        candidates = [
-            os.path.join(local_app, "Programs", "Codex"),
-            os.path.join(local_app, "Codex"),
-            os.path.join(local_app, "CodexStandalone"),
-            os.path.join(local_app, "CodexPatched"),
-            os.path.join(local_app, "OpenAI", "Codex"),
-            r"C:\Program Files\Codex",
-        ]
-        for c in candidates:
-            rp = os.path.join(c, "resources")
-            if os.path.isdir(rp) and (os.path.isfile(os.path.join(rp, "app.asar")) or os.path.isfile(os.path.join(rp, "app.asar1"))):
-                CODEX_RESOURCES = rp
-                break
-        if not CODEX_RESOURCES:
-            # Try to find any Codex installation
-            for base in [local_app, os.path.join(local_app, "Programs")]:
-                if not os.path.isdir(base):
-                    continue
-                for root, dirs, files in os.walk(base):
-                    if "Codex.exe" in files and "resources" in dirs:
-                        rp = os.path.join(root, "resources")
-                        if os.path.isfile(os.path.join(rp, "app.asar")):
-                            CODEX_RESOURCES = rp
-                            break
-                    if CODEX_RESOURCES:
-                        break
-                if CODEX_RESOURCES:
+        if override:
+            CODEX_RESOURCES = override
+        else:
+            mac_candidates = [
+                "/Applications/Codex.app/Contents/Resources",
+                os.path.join(USER_HOME, "Applications", "Codex.app", "Contents", "Resources"),
+            ]
+            for rp in mac_candidates:
+                if _resources_has_app(rp):
+                    CODEX_RESOURCES = rp
                     break
         if not CODEX_RESOURCES:
             print("[ERROR] 未找到 Codex 安装目录。")
-            print("  请确认 Codex 已通过独立安装包安装（非 Microsoft Store 版）。")
-            print(f"  已搜索: {', '.join(candidates)}")
+            print("  请确认 Codex 已安装到 /Applications/Codex.app")
+            print("  或用 CODEX_PATH 环境变量指定，例如:")
+            print("    CODEX_PATH=/path/to/Codex.app python3 patch.py")
             sys.exit(1)
+        # .app = resources 上两级
+        CODEX_APP = os.path.dirname(os.path.dirname(CODEX_RESOURCES))
+
+    elif sys.platform == "win32":
+        PLATFORM = "windows"
+        if override:
+            CODEX_RESOURCES = override
+        else:
+            for c in _windows_codex_candidates():
+                rp = os.path.join(c, "resources")
+                if _resources_has_app(rp):
+                    CODEX_RESOURCES = rp
+                    break
+            if not CODEX_RESOURCES:
+                # 深度搜索：在常见根目录下找 Codex.exe 旁边的 resources
+                search_roots = [
+                    os.environ.get("LOCALAPPDATA", ""),
+                    os.environ.get("PROGRAMFILES", ""),
+                    os.environ.get("PROGRAMFILES(X86)", ""),
+                ]
+                for base in search_roots:
+                    if not base or not os.path.isdir(base):
+                        continue
+                    for root, dirs, files in os.walk(base):
+                        if any(f.lower() == "codex.exe" for f in files):
+                            rp = os.path.join(root, "resources")
+                            if _resources_has_app(rp):
+                                CODEX_RESOURCES = rp
+                                break
+                        if CODEX_RESOURCES:
+                            break
+                    if CODEX_RESOURCES:
+                        break
+        if not CODEX_RESOURCES:
+            print("[ERROR] 未找到 Codex 安装目录。")
+            print("  请确认 Codex 已通过独立安装包安装（非 Microsoft Store 版）。")
+            print("  或用 CODEX_PATH 环境变量指定，例如:")
+            print('    set CODEX_PATH=D:\\Codex && python patch.py')
+            sys.exit(1)
+        CODEX_APP = _find_codex_executable(os.path.dirname(CODEX_RESOURCES))
+
+    elif sys.platform.startswith("linux"):
+        PLATFORM = "linux"
+        if override:
+            CODEX_RESOURCES = override
+        else:
+            linux_candidates = [
+                "/opt/Codex/resources",
+                "/usr/lib/codex/resources",
+                "/usr/lib/Codex/resources",
+                "/usr/share/codex/resources",
+                os.path.join(USER_HOME, ".local", "share", "Codex", "resources"),
+                os.path.join(USER_HOME, "Applications", "Codex", "resources"),
+            ]
+            for rp in linux_candidates:
+                if _resources_has_app(rp):
+                    CODEX_RESOURCES = rp
+                    break
+        if not CODEX_RESOURCES:
+            print("[ERROR] 未找到 Codex 安装目录。")
+            print("  请用 CODEX_PATH 环境变量指定安装位置，例如:")
+            print("    CODEX_PATH=/opt/Codex python3 patch.py")
+            sys.exit(1)
+        CODEX_APP = _find_codex_executable(os.path.dirname(CODEX_RESOURCES))
+
     else:
         print(f"[ERROR] 不支持的操作系统: {sys.platform}")
         sys.exit(1)
@@ -74,6 +240,30 @@ def detect_platform():
         BASE = None  # will be set after asar extraction
     print(f"[INFO] 平台: {PLATFORM}")
     print(f"[INFO] Codex 目录: {CODEX_RESOURCES}")
+    if CODEX_APP:
+        print(f"[INFO] Codex 程序: {CODEX_APP}")
+
+
+def _find_codex_executable(install_root):
+    """在安装根目录中定位 Codex 可执行文件（用于 @electron/fuses）。"""
+    if not install_root or not os.path.isdir(install_root):
+        return None
+    if sys.platform == "win32":
+        names = ["Codex.exe", "codex.exe"]
+    else:
+        names = ["codex", "Codex"]
+    for name in names:
+        candidate = os.path.join(install_root, name)
+        if os.path.isfile(candidate):
+            return candidate
+    # 兜底：扫描根目录一层
+    try:
+        for f in os.listdir(install_root):
+            if f.lower() in ("codex.exe", "codex"):
+                return os.path.join(install_root, f)
+    except OSError:
+        pass
+    return None
 
 
 def load_config():
@@ -112,15 +302,26 @@ def find_file(pattern, search_keywords=None):
     return []
 
 
-def apply_patch(filepath, name, find_str=None, replace_str=None, find_regex=None, replace_fn=None):
-    """应用单个补丁：优先精确匹配，失败则 regex 降级"""
+def apply_patch(filepath, name, find_str=None, replace_str=None, find_regex=None, replace_fn=None, applied_marker=None):
+    """应用单个补丁：优先精确匹配，失败则 regex 降级。
+
+    applied_marker: 可选的正则字符串，用于检测“补丁后的形态”。
+    对于只有 regex（无 replace_str）的补丁，重跑时原始模式已不匹配，
+    单靠 replace_str 无法判断幂等，会误报 FAIL。提供 applied_marker 后，
+    若内容已是补丁后形态则正确标记为 [SKIP]。"""
     with open(filepath, "r", encoding="utf-8") as f:
         content = f.read()
 
     basename = os.path.basename(filepath)
 
-    # 检查是否已应用
+    # 检查是否已应用（精确串）
     if replace_str and replace_str in content:
+        results["skipped"].append(f"{basename}: {name}")
+        print(f"  [SKIP] {name} — 已应用")
+        return content
+
+    # 检查是否已应用（补丁后形态，用于 regex-only 补丁的幂等判断）
+    if applied_marker and re.search(applied_marker, content):
         results["skipped"].append(f"{basename}: {name}")
         print(f"  [SKIP] {name} — 已应用")
         return content
@@ -132,6 +333,7 @@ def apply_patch(filepath, name, find_str=None, replace_str=None, find_regex=None
         print(f"  [OK]   {name}")
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
+        patched_files.add(filepath)
         return content
 
     # Regex 模糊匹配
@@ -146,6 +348,7 @@ def apply_patch(filepath, name, find_str=None, replace_str=None, find_regex=None
                 print(f"  [OK]   {name} (regex匹配)")
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(content)
+                patched_files.add(filepath)
                 return content
 
     results["failed"].append(f"{basename}: {name}")
@@ -254,7 +457,9 @@ def patch_module_2_plugins_i18n():
             find_str=None,
             replace_str=None,
             find_regex=r'([a-zA-Z_$])\?\(0,\$\.jsx\)\([a-zA-Z_$]+,\{tooltipContent:\(0,\$\.jsx\)\([a-zA-Z_$]+,\{id:`sidebarElectron\.pluginsDisabledTooltip`',
-            replace_fn=lambda m: m.group(0).replace(m.group(1) + "?", "0?", 1)
+            replace_fn=lambda m: m.group(0).replace(m.group(1) + "?", "0?", 1),
+            # 补丁后形态：门控变量已被替换为常量 0
+            applied_marker=r'0\?\(0,\$\.jsx\)\([a-zA-Z_$]+,\{tooltipContent:\(0,\$\.jsx\)\([a-zA-Z_$]+,\{id:`sidebarElectron\.pluginsDisabledTooltip`'
         )
 
         # 补丁 2b: i18n 多语言强制启用
@@ -264,7 +469,9 @@ def patch_module_2_plugins_i18n():
             find_str=None,
             replace_str=None,
             find_regex=r'([a-zA-Z_$])=\(0,([a-zA-Z_$]+)\.useMemo\)\(\(\)=>[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\),\[([a-zA-Z_$]+)\]\)',
-            replace_fn=lambda m: f"{m.group(1)}=(0,{m.group(2)}.useMemo)(()=>!0,[{m.group(3)}])"
+            replace_fn=lambda m: f"{m.group(1)}=(0,{m.group(2)}.useMemo)(()=>!0,[{m.group(3)}])",
+            # 补丁后形态：useMemo 直接返回 !0，且原 enable_i18n 取值已被移除
+            applied_marker=r'=\(0,[a-zA-Z_$]+\.useMemo\)\(\(\)=>!0,\[[a-zA-Z_$]+\]\)'
         )
 
 
@@ -456,7 +663,7 @@ def patch_module_7_frontend_models():
     find_str = 'select:({data:r})=>{let i=[],a=new Set(e),o=null;return r.forEach(e=>{if(d?a.has(e.model):!e.hidden){let n=t===`copilot`?[e.supportedReasoningEfforts.find(e=>e.reasoningEffort===`medium`)??{reasoningEffort:`medium`,description:`medium effort`}]:[...e.supportedReasoningEfforts];i.push({...e,supportedReasoningEfforts:n}),e.isDefault&&(o=e)}}),o??=i.find(e=>e.model===n)??null,{models:i,defaultModel:o}}'
     
     # 精确替换字符串（已知特定版本，变量名固定为 r/n）
-    replace_str = f'select:({{data:r}})=>{{let i=[];r.forEach(e=>{{i.push({{...e,hidden:false,supportedReasoningEfforts:[...e.supportedReasoningEfforts]}})}});let extraModels={js_array_str};let template=i[0];if(template){{extraModels.forEach(m=>{{if(!i.some(exist=>exist.model===m)){{let newModel={{...template}};for(let key in newModel){{if(typeof newModel[key]===\"string\"){{if(newModel[key]===template.model||newModel[key]===template.slug){{newModel[key]=m}}else if(newModel[key]===template.displayName||newModel[key]===template.display_name||newModel[key]===`GPT-5.5`){{newModel[key]=m.replace(/-/g,\" \").replace(/\\b\\w/g,c=>c.toUpperCase())}}}};newModel.model=m;newModel.slug=m;newModel.display_name=m.replace(/-/g,\" \").replace(/\\b\\w/g,c=>c.toUpperCase());newModel.displayName=newModel.display_name;newModel.isDefault=false;i.push(newModel)}})}})}});return {{models:i,defaultModel:i.find(e=>e.model===n)||i[0]||null}}'
+    replace_str = f'select:({{data:r}})=>{{let i=[];r.forEach(e=>{{i.push({{...e,hidden:false,supportedReasoningEfforts:[...e.supportedReasoningEfforts]}})}});let extraModels={js_array_str};let template=i[0];if(template){{extraModels.forEach(m=>{{if(!i.some(exist=>exist.model===m)){{let newModel={{...template}};for(let key in newModel){{if(typeof newModel[key]==="string"){{if(newModel[key]===template.model||newModel[key]===template.slug){{newModel[key]=m}}else if(newModel[key]===template.displayName||newModel[key]===template.display_name||newModel[key]===`GPT-5.5`){{newModel[key]=m.replace(/-/g," ").replace(/\\b\\w/g,c=>c.toUpperCase())}}}}}}newModel.model=m;newModel.slug=m;newModel.display_name=m.replace(/-/g," ").replace(/\\b\\w/g,c=>c.toUpperCase());newModel.displayName=newModel.display_name;newModel.isDefault=false;i.push(newModel)}}}})}}return {{models:i,defaultModel:i.find(e=>e.model===n)||i[0]||null}};}}'
 
     # 超强鲁棒性正则模糊匹配，防止未来混淆变量名发生改变
     find_regex = r'select\s*:\s*\(\{\s*data\s*:\s*([a-zA-Z_$]+)\s*\}\)\s*=>\s*\{.*?i\.find\(e=>e\.model===([a-zA-Z_$]+)\).*?defaultModel\s*:\s*[a-zA-Z_$]+\s*\}\}'
@@ -627,6 +834,186 @@ def patch_config():
 
 
 # ================================================================
+# Electron fuses + 代码签名（跨平台，内置于 patch.py，无需依赖外部脚本）
+def validate_patched_syntax():
+    """补丁后用 node --check 校验被修改的 JS 文件语法。
+
+    这是关键安全网：如果某条补丁的替换破坏了 JS 语法（如括号不配对），
+    Codex 启动时 webview 会崩溃卡 logo。这里在写 fuse 之前提前发现语法错误，
+    并自动从备份恢复对应文件，避免用户拿到一个打不开的 Codex。
+    返回 True 表示全部合法（或无法校验时放行），False 表示发现语法错误并已回滚。"""
+    print("\n[校验] 补丁后 JS 语法检查")
+
+    if not patched_files:
+        print("  无新修改文件，跳过校验")
+        return True
+
+    node = resolve_executable("node")
+    if not node:
+        print("  [WARN] 未找到 node，跳过语法校验（建议安装 Node.js 以启用此安全检查）")
+        return True
+
+    import tempfile
+    bad = []
+    for fp in sorted(patched_files):
+        basename = os.path.basename(fp)
+        try:
+            # 复制成 .mjs 让 node 按 ES module 解析（这些文件用 import/export）
+            tmpdir = tempfile.mkdtemp()
+            mjs = os.path.join(tmpdir, basename.replace(".js", ".mjs"))
+            shutil.copyfile(fp, mjs)
+            r = run_command(["node", "--check", mjs],
+                            capture_output=True, text=True, timeout=60)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception as e:
+            print(f"  [WARN] {basename} 无法校验: {e}")
+            continue
+        if r.returncode == 0:
+            print(f"  [OK]   {basename}")
+        else:
+            # 提取 SyntaxError 行
+            err_line = ""
+            for line in (r.stderr or "").splitlines():
+                if "Error:" in line or "SyntaxError" in line:
+                    err_line = line.strip()
+                    break
+            print(f"  [FAIL] {basename} 语法错误: {err_line}")
+            bad.append(fp)
+
+    if not bad:
+        print("  全部补丁文件语法合法")
+        return True
+
+    # 发现语法错误：从备份 asar 恢复受损文件，避免 Codex 打不开
+    print(f"\n  [严重] {len(bad)} 个文件被补丁改出语法错误，正在从备份恢复...")
+    restored = _restore_files_from_backup(bad)
+    if restored:
+        print(f"  已恢复 {restored} 个文件到原始版本（对应功能未生效，但 Codex 可正常启动）")
+    else:
+        print("  [WARN] 自动恢复失败，建议运行: python patch.py --rollback")
+    return False
+
+
+def _restore_files_from_backup(file_paths):
+    """从 app.asar.bak 提取原始版本，覆盖指定的受损文件。返回成功恢复的数量。"""
+    asar_bak = os.path.join(CODEX_RESOURCES, "app.asar.bak")
+    if not os.path.isfile(asar_bak):
+        return 0
+    if not resolve_executable("npx"):
+        return 0
+    import tempfile
+    extract_dir = tempfile.mkdtemp()
+    try:
+        r = run_command(["npx", "-y", "@electron/asar", "e", asar_bak, extract_dir],
+                        capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return 0
+        count = 0
+        for fp in file_paths:
+            # 在解包目录里按相对 webview/assets 路径找原始文件
+            rel = os.path.relpath(fp, BASE)  # 文件名
+            orig = os.path.join(extract_dir, "webview", "assets", rel)
+            if os.path.isfile(orig):
+                shutil.copyfile(orig, fp)
+                count += 1
+        return count
+    finally:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+
+
+def _write_fuse(value, retries=4, delay=1.5):
+    """写单个 Electron fuse，带重试。
+
+    Windows 上 @electron/fuses 连续写同一个 Codex.exe 时，前一次的文件句柄
+    可能还没释放，导致 EBUSY: resource busy or locked。这里捕获该错误并
+    退避重试，使多 fuse 连续写入在任何机器上都稳定。
+    返回 (是否成功, 最后一次 stderr)。"""
+    last_err = ""
+    for attempt in range(1, retries + 1):
+        try:
+            r = run_command(
+                ["npx", "-y", "@electron/fuses", "write", "--app", CODEX_APP, value],
+                capture_output=True, text=True, timeout=120
+            )
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(delay)
+            continue
+        if r.returncode == 0:
+            return True, ""
+        last_err = (r.stderr or "").strip()
+        # EBUSY / 锁定 / 占用 -> 等待后重试；其它错误（如权限）直接返回
+        if "EBUSY" in last_err or "resource busy" in last_err or "locked" in last_err:
+            if attempt < retries:
+                print(f"         {value} 文件被占用，{delay}s 后重试 ({attempt}/{retries})...")
+                time.sleep(delay)
+                continue
+        else:
+            break
+    return False, last_err
+
+
+# ================================================================
+def apply_fuses_and_sign():
+    """关闭 Electron 安全熔断器，让 Codex 从解包的 app/ 目录加载修改后的 JS。
+    macOS 还需重新签名，否则 Gatekeeper 拒绝启动被修改的应用。
+    所有步骤跨平台统一，使 `python patch.py` 在任何机器上都能独立完成补丁。"""
+    print("\n[模块 9] 禁用 Electron 安全熔断器")
+
+    if not CODEX_APP:
+        print("  [WARN] 未定位到 Codex 可执行文件，跳过 fuse 设置。")
+        print("         Codex 可能无法加载补丁，请手动执行 @electron/fuses。")
+        return
+
+    if not resolve_executable("npx"):
+        print("  [WARN] 未找到 npx，跳过 fuse 设置。请安装 Node.js 后重跑。")
+        return
+
+    # 写 fuse 前确保 Codex 进程已退出并释放文件句柄
+    kill_codex()
+    _wait_exe_unlocked(CODEX_APP)
+
+    fuses = [
+        "OnlyLoadAppFromAsar=off",
+        "EnableEmbeddedAsarIntegrityValidation=off",
+        "GrantFileProtocolExtraPrivileges=off",
+        "EnableCookieEncryption=off",
+    ]
+    all_ok = True
+    for fuse in fuses:
+        ok, err = _write_fuse(fuse)
+        if ok:
+            print(f"  [OK]   {fuse}")
+        else:
+            all_ok = False
+            print(f"  [WARN] fuse {fuse} 设置失败（可能需要管理员/sudo 权限）")
+            if err:
+                print(f"         {err.splitlines()[-1] if err.splitlines() else err}")
+    if not all_ok:
+        print("  [HINT] 若 Codex 启动后补丁未生效，请以管理员/sudo 身份重跑本脚本。")
+
+    # macOS 重新签名
+    if PLATFORM == "macos":
+        print("\n[模块 10] macOS 重新签名")
+        if not resolve_executable("codesign"):
+            print("  [WARN] 未找到 codesign（需要 Xcode Command Line Tools），跳过。")
+            return
+        try:
+            r = run_command(
+                ["codesign", "--force", "--deep", "--sign", "-", CODEX_APP],
+                capture_output=True, text=True, timeout=180
+            )
+            if r.returncode == 0:
+                print(f"  [OK]   已重新签名 {CODEX_APP}")
+            else:
+                print(f"  [WARN] 重新签名失败: {r.stderr.strip()}")
+                print("         若 Codex 无法启动，请手动执行:")
+                print(f"         codesign --force --deep --sign - {CODEX_APP}")
+        except Exception as e:
+            print(f"  [WARN] codesign 执行异常: {e}")
+
+
+# ================================================================
 # 汇总报告
 # ================================================================
 def print_report():
@@ -656,6 +1043,43 @@ def print_report():
 # ================================================================
 # 主流程
 # ================================================================
+def kill_codex():
+    """关闭正在运行的 Codex 进程，避免文件被占用导致补丁失败（跨平台）。"""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/f", "/im", "Codex.exe"],
+                           capture_output=True, text=True)
+        elif sys.platform == "darwin":
+            subprocess.run(["pkill", "-x", "Codex"], capture_output=True, text=True)
+        else:
+            subprocess.run(["pkill", "-f", "codex"], capture_output=True, text=True)
+    except Exception:
+        pass
+
+
+def _wait_exe_unlocked(exe_path, timeout=8.0):
+    """等待可执行文件不再被占用（进程退出后句柄释放需要时间）。
+
+    Windows 上以独占方式尝试打开文件来判断是否已解锁；其它平台仅短暂等待。
+    避免 @electron/fuses 因 EBUSY 写入失败。"""
+    if not exe_path or not os.path.isfile(exe_path):
+        time.sleep(0.5)
+        return
+    if sys.platform != "win32":
+        time.sleep(0.8)
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            # 以读写方式独占打开；若被占用会抛 PermissionError/OSError
+            fd = os.open(exe_path, os.O_RDWR)
+            os.close(fd)
+            return
+        except OSError:
+            time.sleep(0.5)
+    # 超时也继续，让后续重试逻辑兜底
+
+
 def main():
     global BASE, CODEX_RESOURCES
 
@@ -664,6 +1088,7 @@ def main():
     print("=" * 60)
 
     detect_platform()
+    kill_codex()
     load_config()
 
     # 检查 asar 状态
@@ -683,11 +1108,17 @@ def main():
             print(f"\n[ERROR] app.asar 不存在且 app/ 未就绪，无法继续。")
             sys.exit(1)
         print("\n[准备] 提取 app.asar...")
-        import subprocess
-        result = subprocess.run(
-            ["npx", "-y", "@electron/asar", "e", asar_path, app_dir],  # -y 防止首次运行时卡在包安装确认
-            capture_output=True, text=True, timeout=120
-        )
+        if not resolve_executable("npx"):
+            print("[ERROR] 未找到 npx，请先安装 Node.js: https://nodejs.org")
+            sys.exit(1)
+        try:
+            result = run_command(
+                ["npx", "-y", "@electron/asar", "e", asar_path, app_dir],  # -y 防止首次运行时卡在包安装确认
+                capture_output=True, text=True, timeout=120
+            )
+        except FileNotFoundError:
+            print("[ERROR] 无法调用 npx，请确认 Node.js 已正确安装并在 PATH 中。")
+            sys.exit(1)
         if result.returncode != 0:
             print(f"[ERROR] 提取失败:\n{result.stderr}")
             sys.exit(1)
@@ -728,12 +1159,22 @@ def main():
     # 配置补全
     patch_config()
 
+    # 补丁后语法校验（关键安全网：防止改坏 JS 导致 Codex 卡 logo）
+    syntax_ok = validate_patched_syntax()
+
+    # 禁用 Electron 熔断器 + macOS 重新签名（内置，跨平台）
+    apply_fuses_and_sign()
+
     # 报告
     print_report()
 
     if results["failed"] and not results["applied"] and not results["skipped"]:
         print("\n[ERROR] 所有补丁均失败！可能是全新版本，请提交 Issue。")
         sys.exit(1)
+
+    if not syntax_ok:
+        print("\n  [注意] 部分补丁因语法问题已自动回退，对应功能未生效，")
+        print("         但 Codex 可正常启动。请把上方 [FAIL] 信息反馈以便修复。")
 
     print(f"\n  Codex 全功能解锁完成。启动 Codex 使用 API key 模式登录即可。")
     print(f"  如需回滚，运行: python3 patch.py --rollback\n")
@@ -742,6 +1183,7 @@ def main():
 def rollback():
     """回滚补丁"""
     detect_platform()
+    kill_codex()
     asar1_path = os.path.join(CODEX_RESOURCES, "app.asar1")
     asar_path = os.path.join(CODEX_RESOURCES, "app.asar")
     app_dir = os.path.join(CODEX_RESOURCES, "app")
@@ -768,25 +1210,18 @@ def rollback():
         os.chmod(MODELS_CACHE, stat.S_IREAD | stat.S_IWRITE)
         print("  已恢复 models_cache.json")
 
-    # 恢复 Electron fuse（将被关掉的安全开关重新打开，让 Codex.exe 回到出厂状态）
-    import subprocess
+    # 恢复 Electron fuse（将被关掉的安全开关重新打开，让 Codex 回到出厂状态）
     print("\n  恢复 Electron 安全熔断器...")
 
-    # 定位 Codex.exe
-    codex_exe = None
-    if PLATFORM == "windows":
-        for name in ["Codex.exe", "codex.exe"]:
-            candidate = os.path.join(os.path.dirname(CODEX_RESOURCES), name)
-            if os.path.isfile(candidate):
-                codex_exe = candidate
-                break
-    elif PLATFORM == "macos":
-        codex_exe = "/Applications/Codex.app"
-
-    if not codex_exe:
+    if not CODEX_APP:
         print("  [WARN] 未找到 Codex 可执行文件，跳过 fuse 恢复。")
         print("         请手动执行: npx -y @electron/fuses write --app <Codex路径> OnlyLoadAppFromAsar=on")
+    elif not resolve_executable("npx"):
+        print("  [WARN] 未找到 npx，跳过 fuse 恢复。请安装 Node.js 后手动执行。")
     else:
+        # 确保 Codex 已退出、文件句柄已释放，避免 EBUSY
+        kill_codex()
+        _wait_exe_unlocked(CODEX_APP)
         fuses_to_restore = [
             "OnlyLoadAppFromAsar=on",
             "EnableEmbeddedAsarIntegrityValidation=on",
@@ -795,18 +1230,30 @@ def rollback():
         ]
         fuse_ok = True
         for fuse in fuses_to_restore:
-            r = subprocess.run(
-                ["npx", "-y", "@electron/fuses", "write", "--app", codex_exe, fuse],
-                capture_output=True, text=True
-            )
-            if r.returncode != 0:
-                print(f"  [WARN] fuse {fuse} 恢复失败（可能需要管理员权限）")
-                print(f"         {r.stderr.strip()}")
-                fuse_ok = False
-            else:
+            ok, err = _write_fuse(fuse)
+            if ok:
                 print(f"  [OK]   {fuse}")
+            else:
+                fuse_ok = False
+                print(f"  [WARN] fuse {fuse} 恢复失败（可能需要管理员权限）")
+                if err:
+                    print(f"         {err.splitlines()[-1] if err.splitlines() else err}")
         if not fuse_ok:
-            print("  [HINT] 请以管理员身份重新运行: python patch.py --rollback")
+            print("  [HINT] 请以管理员/sudo 身份重新运行: python patch.py --rollback")
+
+    # macOS 回滚后需重新签名
+    if PLATFORM == "macos" and CODEX_APP and resolve_executable("codesign"):
+        try:
+            r = run_command(
+                ["codesign", "--force", "--deep", "--sign", "-", CODEX_APP],
+                capture_output=True, text=True, timeout=180
+            )
+            if r.returncode == 0:
+                print("  [OK]   已重新签名")
+            else:
+                print(f"  [WARN] 重新签名失败: {r.stderr.strip()}")
+        except Exception as e:
+            print(f"  [WARN] codesign 执行异常: {e}")
 
     print("回滚完成。")
 
