@@ -48,6 +48,96 @@
 4. 双击桌面上新出现的 **"Codex (Patched)"** 图标
 5. 用 API Key 模式登录，功能全解锁
 
+**点击 bat 后你会看到的完整输出：**
+
+```
+============================================================
+  Codex API Key Unlocker v2.0
+============================================================
+
+[环境检查] 检测前置依赖...
+  [OK]   Node.js (npx): C:\Program Files\nodejs\npx.CMD
+  [OK]   Python: 3.x
+  依赖齐全，继续。
+
+[INFO] 平台: windows
+[INFO] 检测到 Microsoft Store 版 Codex:
+       C:\Program Files\WindowsApps\OpenAI.Codex_26.xxx_x64__xxxxx
+       Store 版受系统沙箱保护，无法直接打补丁。
+       正在将其复制为独立版（纯本地操作，不联网）...
+       目标: C:\Users\你\AppData\Local\CodexStandalone
+       复制中（约 200-300MB，请稍候）...
+       [OK] 复制完成。
+[INFO] Codex 目录: C:\Users\你\AppData\Local\CodexStandalone\resources
+[INFO] Codex 程序: C:\Users\你\AppData\Local\CodexStandalone\Codex.exe
+
+[准备] 提取 app.asar...
+  提取完成
+  已重命名 app.asar -> app.asar1
+
+[模块 0] 会话保持 — use-auth-*.js
+  [OK]   会话保持（authMethod伪装）
+
+[模块 1] Fast 模式 — use-is-fast-mode-enabled-*.js
+  [OK]   Fast 授权门控
+  [OK]   Fast Hook 早期返回
+  [OK]   模型可用性检查
+
+[模块 2] 插件侧边栏 + i18n — app-main-*.js
+  [OK]   插件侧边栏解锁
+  [OK]   i18n 多语言强制启用
+
+[模块 3] 插件连接器
+  [OK]   插件连接器解锁
+
+[模块 4] 品牌视觉
+  [OK]   品牌视觉统一
+
+[模块 5] 语音输入
+  [OK]   语音输入解锁
+
+[模块 6] 用量设置
+  [OK]   用量设置解锁
+
+[模块 7] 前端模型克隆注入
+  [OK]   前端动态模型克隆注入
+
+[模块 8] 补全 config.toml
+  + enable_fast = true
+  + enable_speed_128k = true
+  + enable_pro = true
+  ...
+
+[校验] 补丁后 JS 语法检查
+  [OK]   use-auth-xxx.js
+  [OK]   app-main-xxx.js
+  [OK]   model-queries-xxx.js
+  ...
+  全部补丁文件语法合法
+
+[模块 9] 禁用 Electron 安全熔断器
+  [OK]   OnlyLoadAppFromAsar=off
+  [OK]   EnableEmbeddedAsarIntegrityValidation=off
+  [OK]   GrantFileProtocolExtraPrivileges=off
+  [OK]   EnableCookieEncryption=off
+
+============================================================
+  补丁报告: 12 补丁，11 OK，1 SKIP，0 失败
+============================================================
+
+  桌面快捷方式已创建: Codex (Patched)
+
+  Codex 全功能解锁完成。启动 Codex 使用 API key 模式登录即可。
+
+============================================================
+  Done. Launch Codex and log in with API key mode.
+============================================================
+
+Press any key to continue . . .
+```
+
+> 如果你已有独立版 Codex（非 Store），则不会出现"复制为独立版"那一段，直接从"提取 app.asar"开始。
+
 **脚本自动完成的事（无需手动操作）：**
 
 | 步骤 | 说明 |
