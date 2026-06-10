@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""
-从中转站拉取模型列表并注入 models_cache.json
-用法: python inject_models.py
-需要先在 ~/.codex/config.toml 中配置 base_url 和 bearer_token（或在 auth.json 配置 OPENAI_API_KEY）
-"""
-import json, shutil, urllib.request, os, re, sys
+"""Refresh Codex models_cache.json from the configured OpenAI-compatible relay."""
+
+import copy
+import json
+import os
+import re
+import shutil
+import sys
+import urllib.request
+
 
 USER_HOME = os.path.expanduser("~")
-MODELS_CACHE = os.path.join(USER_HOME, ".codex", "models_cache.json")
-AUTH_JSON = os.path.join(USER_HOME, ".codex", "auth.json")
-CONFIG_TOML = os.path.join(USER_HOME, ".codex", "config.toml")
+CODEX_HOME = os.path.abspath(os.path.expanduser(os.environ.get("CODEX_HOME", os.path.join(USER_HOME, ".codex"))))
+MODELS_CACHE = os.path.join(CODEX_HOME, "models_cache.json")
+AUTH_JSON = os.path.join(CODEX_HOME, "auth.json")
+CONFIG_TOML = os.path.join(CODEX_HOME, "config.toml")
 
 
 def load_api_config():
-    """从 config.toml 或 auth.json 读取 API Key 和 base_url，均不存在则报错退出"""
+    """Read base_url and bearer token from Codex config files."""
     api_key = ""
     api_base = ""
 
-    # 1. 尝试从 config.toml 读取 base_url 和 bearer_token
     if os.path.exists(CONFIG_TOML):
         try:
             with open(CONFIG_TOML, "r", encoding="utf-8") as f:
@@ -29,115 +33,109 @@ def load_api_config():
             if tokens:
                 api_key = tokens[0]
         except Exception as e:
-            print(f"[WARN] 读取 config.toml 失败: {e}")
+            print(f"[WARN] Failed to read config.toml: {e}")
 
-    # 2. 从 auth.json 读取 API Key（优先级低于 config.toml 的 bearer_token）
     if not api_key and os.path.exists(AUTH_JSON):
         try:
             with open(AUTH_JSON, "r", encoding="utf-8") as f:
                 auth = json.load(f)
             api_key = auth.get("OPENAI_API_KEY", "")
         except Exception as e:
-            print(f"[WARN] 读取 auth.json 失败: {e}")
+            print(f"[WARN] Failed to read auth.json: {e}")
 
     if not api_base:
-        print("[ERROR] 未找到 base_url 配置。")
-        print("  请在 ~/.codex/config.toml 中添加:")
-        print('    base_url = "https://你的中转站地址"')
+        print(f"[ERROR] Missing base_url in {CONFIG_TOML}")
+        print('  Example: base_url = "https://your-relay.example.com"')
         sys.exit(1)
 
     if not api_key:
-        print("[ERROR] 未找到 API Key 配置。")
-        print("  请在 ~/.codex/config.toml 中添加:")
-        print('    bearer_token = "sk-..."')
-        print("  或在 ~/.codex/auth.json 中设置 OPENAI_API_KEY。")
+        print(f"[ERROR] Missing bearer token in {CONFIG_TOML} or OPENAI_API_KEY in {AUTH_JSON}")
+        print('  Example: bearer_token = "sk-..."')
         sys.exit(1)
 
     return api_key, api_base
 
 
+def model_display_name(slug):
+    return slug.replace("-", " ").replace("_", " ").title()
+
+
 def main():
     api_key, api_base = load_api_config()
+    print("[INFO] API key loaded; value is hidden.")
+    print(f"[INFO] Relay: {api_base}")
 
-    print(f"[INFO] API Key: {api_key[:8]}...{api_key[-4:] if len(api_key) > 12 else ''}")
-    print(f"[INFO] 中转站: {api_base}")
-
-    # 拉取中转站模型
     try:
         req = urllib.request.Request(
             f"{api_base}/v1/models",
-            headers={"Authorization": f"Bearer {api_key}"}
+            headers={"Authorization": f"Bearer {api_key}"},
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             proxy_models = json.loads(resp.read()).get("data", [])
     except Exception as e:
-        print(f"[ERROR] 无法连接到中转站: {e}")
-        print(f"  请检查 base_url 是否正确，以及网络是否可用。")
+        print(f"[ERROR] Failed to query relay models: {e}")
         sys.exit(1)
 
-    proxy_slugs = {m["id"] for m in proxy_models if m.get("id")}
-    print(f"[INFO] 中转站模型总数: {len(proxy_slugs)} 个")
+    proxy_slugs = {m.get("id") for m in proxy_models if isinstance(m, dict) and m.get("id")}
+    print(f"[INFO] Relay models: {len(proxy_slugs)}")
 
-    # 读取现有缓存
     if not os.path.exists(MODELS_CACHE):
-        print(f"[ERROR] 未找到 models_cache.json: {MODELS_CACHE}")
-        print("  请先启动 Codex 至少一次，让它生成缓存文件。")
+        print(f"[ERROR] Missing models cache: {MODELS_CACHE}")
+        print("  Start Codex at least once, then rerun this tool.")
         sys.exit(1)
 
     try:
         with open(MODELS_CACHE, "r", encoding="utf-8") as f:
             cache = json.load(f)
     except Exception as e:
-        print(f"[ERROR] 读取 models_cache.json 失败: {e}")
+        print(f"[ERROR] Failed to read models_cache.json: {e}")
         sys.exit(1)
 
-    existing_slugs = {m["slug"] for m in cache.get("models", [])}
-    print(f"[INFO] 缓存现有模型: {len(existing_slugs)} 个")
-    print(f"[INFO] 现有模型: {sorted(existing_slugs)}")
+    models = cache.get("models")
+    if not isinstance(models, list) or not models:
+        print("[ERROR] models_cache.json does not contain a usable models list.")
+        sys.exit(1)
 
-    new_slugs = proxy_slugs - existing_slugs
-    print(f"[INFO] 待新增: {len(new_slugs)} 个")
+    existing = {m.get("slug") or m.get("id") or m.get("model") for m in models if isinstance(m, dict)}
+    new_slugs = sorted(proxy_slugs - existing)
+    print(f"[INFO] Existing cached models: {len(existing)}")
+    print(f"[INFO] Models to add: {len(new_slugs)}")
 
     if not new_slugs:
-        print("[SKIP] 所有模型已在缓存中，无需注入")
+        print("[SKIP] All relay models already exist in the cache.")
         return
 
-    if not cache.get("models"):
-        print("[ERROR] 缓存中没有现有模型定义，无法生成模板。")
-        sys.exit(1)
-
-    # 用第一个模型作为模板
-    template = json.loads(json.dumps(cache["models"][0]))
-
-    for slug in sorted(new_slugs):
-        new_model = json.loads(json.dumps(template))
+    template = models[0]
+    for slug in new_slugs:
+        new_model = copy.deepcopy(template)
+        for key, value in list(new_model.items()):
+            if isinstance(value, str) and value in existing:
+                new_model[key] = slug
         new_model["slug"] = slug
-        new_model["display_name"] = slug.replace("-", " ").title()
+        new_model["id"] = slug
+        new_model["model"] = slug
+        new_model["display_name"] = model_display_name(slug)
+        new_model["displayName"] = new_model["display_name"]
         new_model["description"] = f"Model: {slug}"
+        new_model["hidden"] = False
         new_model["visibility"] = "list"
         new_model["supported_in_api"] = True
-        new_model["additional_speed_tiers"] = []
-        new_model["service_tiers"] = []
-        cache["models"].append(new_model)
+        models.append(new_model)
         print(f"  + {slug}")
 
-    # 备份
-    bak = MODELS_CACHE + ".bak"
-    if not os.path.exists(bak):
-        shutil.copy2(MODELS_CACHE, bak)
-        print(f"[INFO] 已备份: {bak}")
+    backup = MODELS_CACHE + ".bak"
+    if not os.path.exists(backup):
+        shutil.copy2(MODELS_CACHE, backup)
+        print(f"[INFO] Backup created: {backup}")
 
-    # 写入
     try:
         with open(MODELS_CACHE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[ERROR] 写入 models_cache.json 失败: {e}")
-        print("  请以管理员身份运行，或检查文件权限。")
+        print(f"[ERROR] Failed to write models_cache.json: {e}")
         sys.exit(1)
 
-    print(f"\n[完成] 模型总数: {len(cache['models'])} 个")
-    print("重启 Codex 即可看到所有模型！")
+    print(f"[DONE] Total cached models: {len(models)}")
 
 
 if __name__ == "__main__":

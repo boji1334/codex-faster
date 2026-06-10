@@ -6,7 +6,6 @@ Codex API Key 全功能解锁 — 一键补丁引擎
 """
 
 import os, glob, re, sys, json, shutil, stat, subprocess, time, urllib.request
-from pathlib import Path
 
 # ================================================================
 # 配置
@@ -18,8 +17,18 @@ CODEX_APP = None  # @electron/fuses 的目标：macOS 为 .app，其它平台为
 API_BASE_URL = None
 API_KEY = None
 USER_HOME = os.path.expanduser("~")
-CONFIG_PATH = os.path.join(USER_HOME, ".codex", "config.toml")
-MODELS_CACHE = os.path.join(USER_HOME, ".codex", "models_cache.json")
+CODEX_HOME = os.path.abspath(os.path.expanduser(os.environ.get("CODEX_HOME", os.path.join(USER_HOME, ".codex"))))
+CONFIG_PATH = os.path.join(CODEX_HOME, "config.toml")
+MODELS_CACHE = os.path.join(CODEX_HOME, "models_cache.json")
+SESSION_INDEX = os.path.join(CODEX_HOME, "session_index.jsonl")
+SESSIONS_DIR = os.path.join(CODEX_HOME, "sessions")
+ARCHIVED_SESSIONS_DIR = os.path.join(CODEX_HOME, "archived_sessions")
+WINDOWS_STANDALONE_DIR_NAME = "Codex-boji"
+WINDOWS_LEGACY_STANDALONE_DIR_NAMES = ["CodexStandalone", "CodexPatched"]
+WINDOWS_SHORTCUT_NAME = "Codex-boji"
+WINDOWS_LEGACY_SHORTCUT_NAMES = ["Codex (Patched)", "Codex"]
+WINDOWS_UPDATE_STATUS = os.path.join(CODEX_HOME, "codex_boji_update_status.json")
+WINDOWS_ACTIVE_BUILD_STATUS = os.path.join(CODEX_HOME, "codex_boji_active_build.json")
 
 results = {"applied": [], "skipped": [], "failed": []}
 patched_files = set()  # 记录真正被写入修改过的 JS 文件，用于补丁后语法校验
@@ -51,20 +60,64 @@ def run_command(args, **kwargs):
     关键点：Windows 上 npx / @electron 等工具是 .cmd/.bat 批处理脚本。
     不同 Python 版本对“用 subprocess 列表参数直接执行 .cmd”的支持不一致
     （3.7 及更早版本可能失败，且涉及 CVE-2024-3566 的安全修复）。
-    为了在任何机器、任何 Python 版本上都稳定，这里对 .cmd/.bat 显式用
-    `cmd /c` 包裹调用，而不依赖解释器的隐式行为。
+    为了在任何机器、任何 Python 版本上都稳定，npx 会优先绕开
+    npx.CMD，直接用 node.exe 执行 npx-cli.js。
     """
     exe = resolve_executable(args[0])
+    if sys.platform == "win32" and args and args[0].lower() == "npx":
+        npx_args = _windows_npx_command(list(args[1:]))
+        if npx_args:
+            return subprocess.run(npx_args, **kwargs)
     if exe:
         if sys.platform == "win32" and exe.lower().endswith((".cmd", ".bat")):
-            # 用 cmd /c 显式执行批处理包装器，跨 Python 版本可靠
-            return subprocess.run(["cmd", "/c", exe] + list(args[1:]), **kwargs)
+            # 直接执行批处理文件，让 Python 构造完整命令行。不要用
+            # ["cmd", "/c", exe, ...]，否则 npx.CMD 内部的 %* 会把
+            # "C:\\Program Files\\..." 这类参数重新拆坏。
+            return subprocess.run([exe] + list(args[1:]), **kwargs)
         return subprocess.run([exe] + list(args[1:]), **kwargs)
     # 回退：Windows 下用 shell 解析（处理 PATH 中只有 .cmd 包装器的边缘情况）
     if sys.platform == "win32":
         return subprocess.run(" ".join(f'"{a}"' if " " in a else a for a in args),
                               shell=True, **kwargs)
     raise FileNotFoundError(args[0])
+
+
+def _windows_npx_command(extra_args):
+    """Return a batch-free npx invocation on Windows when Node.js is installed.
+
+    npm's generated npx.CMD forwards arguments with `%*`. When Python calls it
+    through an extra `cmd /c` layer, quoted paths such as `C:\\Program Files\\...`
+    can be split and `@electron/asar` then fails with `C:\\Program` errors.
+    Running npx-cli.js through node.exe avoids that wrapper entirely.
+    """
+    if sys.platform != "win32":
+        return None
+    npx = resolve_executable("npx")
+    if not npx:
+        return None
+    node = resolve_executable("node")
+    npx_dir = os.path.dirname(npx)
+    cli_candidates = [
+        os.path.join(npx_dir, "node_modules", "npm", "bin", "npx-cli.js"),
+        os.path.join(os.path.dirname(npx_dir), "node_modules", "npm", "bin", "npx-cli.js"),
+        os.path.join(npx_dir, "npx-cli.js"),
+    ]
+    cli = next((p for p in cli_candidates if os.path.isfile(p)), None)
+    if node and cli:
+        return [node, cli] + extra_args
+    return None
+
+
+def _is_windows_store_path(path):
+    """Return True for Microsoft Store package paths that should not be patched in place."""
+    if sys.platform != "win32" or not path:
+        return False
+    try:
+        norm = os.path.normcase(os.path.abspath(path))
+    except OSError:
+        norm = os.path.normcase(path)
+    marker = os.path.normcase(os.path.join("WindowsApps", ""))
+    return marker in norm
 
 
 def _windows_codex_candidates():
@@ -80,8 +133,8 @@ def _windows_codex_candidates():
     sub_dirs = [
         ["Programs", "Codex"],
         ["Codex"],
-        ["CodexStandalone"],
-        ["CodexPatched"],
+        [WINDOWS_STANDALONE_DIR_NAME],
+        *([name] for name in WINDOWS_LEGACY_STANDALONE_DIR_NAMES),
         ["OpenAI", "Codex"],
         ["Programs", "@openai", "codex"],
     ]
@@ -100,6 +153,368 @@ def _resources_has_app(rp):
         or os.path.isfile(os.path.join(rp, "app.asar1"))
         or os.path.isdir(os.path.join(rp, "app"))
     )
+
+
+def _version_key(version):
+    """Return a comparable tuple for dotted package versions."""
+    if not version:
+        return ()
+    return tuple(int(p) if p.isdigit() else 0 for p in re.split(r"[._-]", version) if p)
+
+
+def _parse_store_version(path):
+    name = os.path.basename(os.path.normpath(path or ""))
+    m = re.search(r"OpenAI\.Codex_([0-9][0-9A-Za-z._-]*)_", name, re.I)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _store_install_record(candidate):
+    """Return normalized Store install metadata when a candidate is patchable."""
+    resources = [
+        os.path.join(candidate, "app", "resources"),
+        os.path.join(candidate, "resources"),
+        candidate,
+    ]
+    for res in resources:
+        if _resources_has_app(res):
+            app_root = os.path.dirname(res) if os.path.basename(res).lower() == "resources" else candidate
+            exe = _find_codex_executable(app_root)
+            return {
+                "package_root": candidate,
+                "copy_root": app_root,
+                "resources": res,
+                "exe": exe,
+                "version": _parse_store_version(candidate),
+            }
+    return None
+
+
+def _find_windows_store_codex():
+    """Find the newest readable Microsoft Store Codex package."""
+    if sys.platform != "win32":
+        return None
+    win_apps = os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"), "WindowsApps")
+    if not os.path.isdir(win_apps):
+        return None
+
+    records = []
+    try:
+        for d in os.listdir(win_apps):
+            dl = d.lower()
+            if ("openai" in dl and "codex" in dl) or "9plm9xgg6vks" in dl:
+                record = _store_install_record(os.path.join(win_apps, d))
+                if record:
+                    records.append(record)
+    except PermissionError:
+        raise
+    except OSError:
+        return None
+
+    if not records:
+        return None
+    records.sort(key=lambda r: _version_key(r.get("version")), reverse=True)
+    return records[0]
+
+
+def _find_windows_store_codex_appx():
+    """Read Store Codex metadata without requiring WindowsApps directory access."""
+    if sys.platform != "win32":
+        return None
+    ps = r'''
+$pkg = Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+if ($pkg) {
+  [pscustomobject]@{
+    Name = $pkg.Name
+    Version = $pkg.Version.ToString()
+    InstallLocation = $pkg.InstallLocation
+  } | ConvertTo-Json -Compress
+}
+'''
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=12
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        data = json.loads(r.stdout)
+        location = data.get("InstallLocation")
+        version = data.get("Version")
+        resources = os.path.join(location, "app", "resources") if location else None
+        return {
+            "package_root": location,
+            "copy_root": os.path.join(location, "app") if location else None,
+            "resources": resources,
+            "exe": os.path.join(location, "app", "Codex.exe") if location else None,
+            "version": version,
+            "metadata_only": True,
+        }
+    except Exception:
+        return None
+
+
+def _write_update_status(status):
+    try:
+        os.makedirs(CODEX_HOME, exist_ok=True)
+        with open(WINDOWS_UPDATE_STATUS, "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  [WARN] 写入更新状态失败: {e}")
+
+
+def _read_active_build_root():
+    if sys.platform != "win32" or not os.path.isfile(WINDOWS_ACTIVE_BUILD_STATUS):
+        return None
+    try:
+        with open(WINDOWS_ACTIVE_BUILD_STATUS, "r", encoding="utf-8") as f:
+            root = json.load(f).get("active_root")
+        if isinstance(root, str) and os.path.isdir(root):
+            return root
+    except Exception:
+        pass
+    return None
+
+
+def _write_active_build_root(root, reason=None):
+    if sys.platform != "win32" or not root:
+        return
+    try:
+        os.makedirs(CODEX_HOME, exist_ok=True)
+        payload = {
+            "active_root": root,
+            "reason": reason or "active patched Codex build",
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        with open(WINDOWS_ACTIVE_BUILD_STATUS, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  [WARN] 写入活动版本状态失败: {e}")
+
+
+def _read_boji_version(root):
+    manifest = os.path.join(root, ".codex-boji.json")
+    if os.path.isfile(manifest):
+        try:
+            with open(manifest, "r", encoding="utf-8") as f:
+                return json.load(f).get("source_version")
+        except Exception:
+            return None
+    return None
+
+
+def _write_boji_manifest(root, store_record):
+    manifest = {
+        "name": WINDOWS_STANDALONE_DIR_NAME,
+        "source": "Microsoft Store Codex",
+        "source_version": store_record.get("version") if store_record else None,
+        "source_package_root": store_record.get("package_root") if store_record else None,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    try:
+        with open(os.path.join(root, ".codex-boji.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"       [WARN] 写入 Codex-boji 元数据失败: {e}")
+
+
+def _check_windows_boji_update(store_record=None, standalone_root=None, write=True):
+    """Compare Store Codex with the local Codex-boji copy."""
+    if sys.platform != "win32":
+        return None
+    if store_record is None:
+        try:
+            store_record = _find_windows_store_codex()
+        except PermissionError:
+            store_record = _find_windows_store_codex_appx()
+    if standalone_root is None:
+        standalone_root = _windows_standalone_root()
+
+    boji_version = _read_boji_version(standalone_root) if standalone_root and os.path.isdir(standalone_root) else None
+    store_version = store_record.get("version") if store_record else None
+    update_available = False
+    if store_version and boji_version:
+        update_available = _version_key(store_version) > _version_key(boji_version)
+    status = {
+        "app_name": WINDOWS_STANDALONE_DIR_NAME,
+        "store_version": store_version,
+        "boji_version": boji_version,
+        "update_available": update_available,
+        "store_package_root": store_record.get("package_root") if store_record else None,
+        "boji_root": standalone_root,
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    if write:
+        _write_update_status(status)
+    return status
+
+
+def _copy_tree_robust(src, dst):
+    """Copy a Codex app directory, using robocopy on Windows for deep app trees."""
+    src_abs = os.path.abspath(src)
+    dst_abs = os.path.abspath(dst)
+    if os.path.normcase(src_abs) == os.path.normcase(dst_abs):
+        raise RuntimeError("source and destination are the same directory")
+
+    if sys.platform == "win32" and resolve_executable("robocopy"):
+        os.makedirs(dst_abs, exist_ok=True)
+        r = run_command(
+            [
+                "robocopy",
+                src_abs,
+                dst_abs,
+                "/E",
+                "/COPY:DAT",
+                "/DCOPY:DAT",
+                "/XJ",
+                "/R:2",
+                "/W:1",
+                "/NFL",
+                "/NDL",
+                "/NJH",
+                "/NJS",
+                "/NP",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=600,
+        )
+        # Robocopy uses 0-7 for success/info, >=8 for actual failure.
+        if r.returncode < 8:
+            return
+        output = "\n".join((r.stdout or "", r.stderr or "").splitlines()[-8:])
+        raise RuntimeError(f"robocopy failed with exit code {r.returncode}\n{output}")
+
+    shutil.copytree(src_abs, dst_abs, dirs_exist_ok=True)
+
+
+def _remove_tree_robust(path):
+    """Remove a tree, using robocopy on Windows for deep node_modules paths."""
+    if not path or not os.path.exists(path):
+        return
+
+    path_abs = os.path.abspath(path)
+    if not os.path.isdir(path_abs):
+        os.remove(path_abs)
+        return
+
+    if sys.platform == "win32" and resolve_executable("robocopy"):
+        parent = os.path.dirname(path_abs)
+        empty = os.path.join(parent, ".codex_boji_empty_delete")
+        try:
+            os.makedirs(empty, exist_ok=True)
+            r = run_command(
+                [
+                    "robocopy",
+                    empty,
+                    path_abs,
+                    "/MIR",
+                    "/XJ",
+                    "/R:2",
+                    "/W:1",
+                    "/NFL",
+                    "/NDL",
+                    "/NJH",
+                    "/NJS",
+                    "/NP",
+                ],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=300,
+            )
+            if r.returncode >= 8:
+                output = "\n".join((r.stdout or "", r.stderr or "").splitlines()[-8:])
+                raise OSError(f"robocopy mirror delete failed with exit code {r.returncode}\n{output}")
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+        try:
+            os.rmdir(path_abs)
+            return
+        except OSError:
+            pass
+
+    shutil.rmtree(path_abs)
+
+
+def _replace_file_retry(src, dst, attempts=10, delay=0.8):
+    """Replace a file, retrying transient Windows locks from AV/indexers."""
+    last_error = None
+    for _ in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as e:
+            last_error = e
+            if sys.platform != "win32":
+                raise
+            time.sleep(delay)
+    raise last_error
+
+
+def _copy_file_replace_retry(src, dst, attempts=10, delay=0.8):
+    tmp = dst + ".copytmp"
+    last_error = None
+    for _ in range(attempts):
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            shutil.copy2(src, tmp)
+            _replace_file_retry(tmp, dst, attempts=1, delay=delay)
+            return
+        except OSError as e:
+            last_error = e
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            if sys.platform != "win32":
+                raise
+            time.sleep(delay)
+    raise last_error
+
+
+def _replace_tree_retry(src, dst, root, attempts=10, delay=0.8):
+    """Replace a directory tree, retrying transient Windows locks."""
+    last_error = None
+    for _ in range(attempts):
+        try:
+            if os.path.isdir(dst):
+                if not _path_is_within(dst, root):
+                    raise OSError(f"拒绝删除非 resources 内目录: {dst}")
+                _remove_tree_robust(dst)
+            elif os.path.exists(dst):
+                os.remove(dst)
+            os.replace(src, dst)
+            return
+        except OSError as e:
+            last_error = e
+            if sys.platform != "win32":
+                raise
+            time.sleep(delay)
+    raise last_error
+
+
+def _asar_unpacked_path(asar_path):
+    return asar_path + ".unpacked"
+
+
+def _backup_original_asar_files():
+    """Keep the original archive and its unpacked sidecar together."""
+    asar1_path = os.path.join(CODEX_RESOURCES, "app.asar1")
+    asar_bak = os.path.join(CODEX_RESOURCES, "app.asar.bak")
+    unpacked_path = _asar_unpacked_path(os.path.join(CODEX_RESOURCES, "app.asar"))
+    unpacked_bak = os.path.join(CODEX_RESOURCES, "app.asar.unpacked.bak")
+
+    if os.path.exists(asar1_path) and not os.path.exists(asar_bak):
+        shutil.copy2(asar1_path, asar_bak)
+        print(f"  已备份: {asar_bak}")
+    if os.path.isdir(unpacked_path) and not os.path.exists(unpacked_bak):
+        _copy_tree_robust(unpacked_path, unpacked_bak)
+        print(f"  已备份: {unpacked_bak}")
 
 
 def _user_override_resources():
@@ -141,7 +556,7 @@ def _user_override_resources():
     return None
 
 
-def detect_platform():
+def detect_platform(convert_store=True):
     global PLATFORM, CODEX_RESOURCES, CODEX_APP, BASE
 
     # 1. 用户显式指定的路径优先（任何平台通用）
@@ -171,13 +586,32 @@ def detect_platform():
 
     elif sys.platform == "win32":
         PLATFORM = "windows"
+        if override and _is_windows_store_path(override):
+            print("[WARN] 指定路径位于 WindowsApps。Store 版不会被原地修改，将改为复制到 Codex-boji 后打补丁。")
+            override = None
         if override:
             CODEX_RESOURCES = override
         else:
+            active = _read_active_build_root()
+            if active:
+                for rp in (os.path.join(active, "resources"), os.path.join(active, "app", "resources")):
+                    if _resources_has_app(rp):
+                        CODEX_RESOURCES = rp
+                        break
+            preferred = _windows_standalone_root()
+            if not CODEX_RESOURCES and preferred:
+                for rp in (os.path.join(preferred, "resources"), os.path.join(preferred, "app", "resources")):
+                    if _resources_has_app(rp):
+                        CODEX_RESOURCES = rp
+                        break
             for c in _windows_codex_candidates():
-                rp = os.path.join(c, "resources")
-                if _resources_has_app(rp):
-                    CODEX_RESOURCES = rp
+                if CODEX_RESOURCES:
+                    break
+                for rp in (os.path.join(c, "resources"), os.path.join(c, "app", "resources")):
+                    if _resources_has_app(rp) and not _is_windows_store_path(rp):
+                        CODEX_RESOURCES = rp
+                        break
+                if CODEX_RESOURCES:
                     break
             if not CODEX_RESOURCES:
                 # 深度搜索：在常见根目录下找 Codex.exe 旁边的 resources
@@ -190,18 +624,23 @@ def detect_platform():
                     if not base or not os.path.isdir(base):
                         continue
                     for root, dirs, files in os.walk(base):
+                        if _is_windows_store_path(root):
+                            dirs[:] = []
+                            continue
                         if any(f.lower() == "codex.exe" for f in files):
                             rp = os.path.join(root, "resources")
-                            if _resources_has_app(rp):
+                            if _resources_has_app(rp) and not _is_windows_store_path(rp):
                                 CODEX_RESOURCES = rp
                                 break
                         if CODEX_RESOURCES:
                             break
                     if CODEX_RESOURCES:
                         break
-        if not CODEX_RESOURCES:
-            # 最后尝试：检测 Microsoft Store 版并自动转换为独立版
-            store_res = _convert_store_to_standalone()
+            store_res = None
+            if not CODEX_RESOURCES and convert_store:
+                # 最后尝试：检测 Microsoft Store 版并自动转换为独立版。
+                # Store 版只作为复制源，永远不在 WindowsApps 中原地打补丁。
+                store_res = _convert_store_to_standalone()
             if store_res:
                 CODEX_RESOURCES = store_res
         if not CODEX_RESOURCES:
@@ -277,63 +716,53 @@ def _convert_store_to_standalone():
     """检测 Microsoft Store 版 Codex，将其复制为独立版供补丁使用。
 
     纯本地操作：只是把用户电脑上已有的 Store 版文件复制到
-    %LOCALAPPDATA%\\CodexStandalone\\，不联网、不下载任何东西。
+    %LOCALAPPDATA%\\Codex-boji\\，不联网、不下载任何东西。
     需要管理员权限（读取 WindowsApps 目录）。
     返回独立版的 resources 路径，失败返回 None。"""
     if sys.platform != "win32":
         return None
 
-    win_apps = os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"), "WindowsApps")
-    if not os.path.isdir(win_apps):
-        return None
-
-    # Store 版目录名格式: OpenAI.Codex_<version>_x64__<publisherhash>
-    # 或 OpenAI.ChatGPTDesktop (早期名称)
-    store_dir = None
     try:
-        for d in os.listdir(win_apps):
-            dl = d.lower()
-            if ("openai" in dl and "codex" in dl) or "9plm9xgg6vks" in dl:
-                candidate = os.path.join(win_apps, d)
-                # 确认里面有 app.asar 或 resources 目录
-                res = os.path.join(candidate, "resources")
-                if os.path.isfile(os.path.join(res, "app.asar")):
-                    store_dir = candidate
-                    break
-                # 有些 Store 包 app.asar 直接在根目录
-                if os.path.isfile(os.path.join(candidate, "app.asar")):
-                    store_dir = candidate
-                    break
+        store = _find_windows_store_codex()
     except PermissionError:
         print("\n[INFO] 检测到 Microsoft Store 版 Codex，但无权限读取 WindowsApps 目录。")
         print("       请以管理员身份运行本脚本（右键 patch.bat → 以管理员身份运行）。")
         return None
-    except OSError:
-        return None
 
-    if not store_dir:
+    if not store:
         return None
 
     # 找到了 Store 版，提示用户并复制
     print(f"\n[INFO] 检测到 Microsoft Store 版 Codex:")
-    print(f"       {store_dir}")
+    print(f"       {store['package_root']}")
     print(f"       Store 版受系统沙箱保护，无法直接打补丁。")
-    print(f"       正在将其复制为独立版（纯本地操作，不联网）...")
+    print(f"       正在将其复制为 {WINDOWS_STANDALONE_DIR_NAME}（纯本地操作，不联网）...")
 
-    standalone_root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "CodexStandalone")
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if not localappdata:
+        print("       [ERROR] 未找到 LOCALAPPDATA，无法创建独立版目录。")
+        return None
+
+    standalone_root = os.path.join(localappdata, WINDOWS_STANDALONE_DIR_NAME)
     standalone_res = os.path.join(standalone_root, "resources")
 
     # 如果已经复制过且 resources 里有 app.asar，跳过复制
     if _resources_has_app(standalone_res):
-        print(f"       独立版已存在: {standalone_root}，跳过复制。")
+        print(f"       {WINDOWS_STANDALONE_DIR_NAME} 已存在: {standalone_root}，跳过复制。")
+        status = _check_windows_boji_update(store, standalone_root)
+        if status and status.get("update_available"):
+            print(f"       [UPDATE] Store 版更新: {status.get('store_version')} > {status.get('boji_version')}")
+            print("                可重新同步 Codex-boji 后再打补丁。")
         return standalone_res
 
     # 执行复制
     try:
         print(f"       目标: {standalone_root}")
         print(f"       复制中（约 200-300MB，请稍候）...")
-        shutil.copytree(store_dir, standalone_root, dirs_exist_ok=True)
+        _copy_tree_robust(store["copy_root"], standalone_root)
         print(f"       [OK] 复制完成。")
+        _write_boji_manifest(standalone_root, store)
+        _check_windows_boji_update(store, standalone_root)
     except PermissionError:
         print(f"       [ERROR] 无权限复制。请以管理员身份运行。")
         return None
@@ -391,6 +820,24 @@ def find_file(pattern, search_keywords=None):
     return []
 
 
+def file_contains(filepath, *needles):
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        return all(needle in content for needle in needles)
+    except OSError:
+        return False
+
+
+def find_asset_files_containing(pattern, *needles):
+    if BASE is None:
+        return []
+    return [
+        f for f in glob.glob(os.path.join(BASE, pattern))
+        if file_contains(f, *needles)
+    ]
+
+
 def apply_patch(filepath, name, find_str=None, replace_str=None, find_regex=None, replace_fn=None, applied_marker=None):
     """应用单个补丁：优先精确匹配，失败则 regex 降级。
 
@@ -445,6 +892,120 @@ def apply_patch(filepath, name, find_str=None, replace_str=None, find_regex=None
     return None
 
 
+def mark_skipped(name, reason, filepath=None):
+    label = f"{os.path.basename(filepath)}: {name}" if filepath else name
+    results["skipped"].append(label)
+    print(f"  [SKIP] {name} — {reason}")
+
+
+def append_js_once(filepath, name, marker, snippet):
+    """Append or update a JS snippet and keep sourceMappingURL comments at EOF."""
+    basename = os.path.basename(filepath)
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as e:
+        results["failed"].append(f"{basename}: {name}")
+        print(f"  [FAIL] {name} — 无法读取: {e}")
+        return False
+
+    def write_updated(updated, status):
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(updated)
+        except OSError as e:
+            results["failed"].append(f"{basename}: {name}")
+            print(f"  [FAIL] {name} — 无法写入: {e}")
+            return False
+        patched_files.add(filepath)
+        results["applied"].append(f"{basename}: {name}")
+        print(f"  [OK]   {name}{status}")
+        return True
+
+    if marker in content:
+        marker_comment = f"/* {marker} */"
+        start = content.find(marker_comment)
+        if start < 0:
+            results["skipped"].append(f"{basename}: {name}")
+            print(f"  [SKIP] {name} — 已应用")
+            return True
+        source_map = re.search(r"\n//# sourceMappingURL=.*?$", content[start:], flags=re.S)
+        end = start + source_map.start() if source_map else len(content)
+        old_block = content[start:end].strip()
+        new_block = snippet.strip()
+        if old_block == new_block:
+            results["skipped"].append(f"{basename}: {name}")
+            print(f"  [SKIP] {name} — 已应用")
+            return True
+        updated = content[:start].rstrip() + "\n" + snippet.rstrip() + "\n" + content[end:].lstrip("\n")
+        return write_updated(updated, "（已更新）")
+
+    source_map = re.search(r"\n//# sourceMappingURL=.*?$", content, flags=re.S)
+    if source_map:
+        insert_at = source_map.start()
+        updated = content[:insert_at].rstrip() + "\n" + snippet.rstrip() + "\n" + content[insert_at:]
+    else:
+        updated = content.rstrip() + "\n" + snippet.rstrip() + "\n"
+
+    return write_updated(updated, "")
+
+
+def remove_js_once(filepath, name, marker):
+    """Remove a previously injected JS snippet and keep sourceMappingURL comments at EOF."""
+    basename = os.path.basename(filepath)
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as e:
+        results["failed"].append(f"{basename}: {name}")
+        print(f"  [FAIL] {name} — 无法读取: {e}")
+        return False
+
+    marker_comment = f"/* {marker} */"
+    start = content.find(marker_comment)
+    if start < 0:
+        print(f"  [SKIP] {name} — 未安装")
+        return True
+
+    source_map = re.search(r"\n//# sourceMappingURL=.*?$", content[start:], flags=re.S)
+    end = start + source_map.start() if source_map else len(content)
+    updated = content[:start].rstrip() + "\n" + content[end:].lstrip("\n")
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(updated)
+    except OSError as e:
+        results["failed"].append(f"{basename}: {name}")
+        print(f"  [FAIL] {name} — 无法写入: {e}")
+        return False
+    patched_files.add(filepath)
+    results["applied"].append(f"{basename}: {name}")
+    print(f"  [OK]   {name}（已移除）")
+    return True
+
+
+def find_build_file(pattern, search_keywords=None):
+    """Find files under app/.vite/build. Used for Electron main/preload patches."""
+    app_dir = os.path.join(CODEX_RESOURCES, "app") if CODEX_RESOURCES else None
+    if not app_dir:
+        return []
+    build_dir = os.path.join(app_dir, ".vite", "build")
+    matches = glob.glob(os.path.join(build_dir, pattern))
+    if matches:
+        return matches
+    if search_keywords and os.path.isdir(build_dir):
+        print(f"  未找到 {pattern}，按特征搜索...")
+        for f in glob.glob(os.path.join(build_dir, "*.js")):
+            try:
+                with open(f, "r", encoding="utf-8") as fh:
+                    c = fh.read(1024 * 200)
+                if all(kw in c for kw in search_keywords):
+                    print(f"  -> 发现目标: {os.path.basename(f)}")
+                    return [f]
+            except OSError:
+                pass
+    return []
+
+
 # ================================================================
 # 模块 0: use-auth — 会话保持（authMethod 伪装为 chatgpt）
 # ================================================================
@@ -474,18 +1035,51 @@ def patch_module_0_session_persist():
 # 模块 1: Fast 模式 — use-is-fast-mode-enabled-*.js
 # ================================================================
 def patch_module_1_fast_mode():
-    print("\n[模块 1] Fast 模式 — use-is-fast-mode-enabled-*.js")
-    files = find_file("use-is-fast-mode-enabled-*.js",
-                      search_keywords=["authMethod", "canUseFastMode"])
-    if not files:
-        # Fallback: search permissions-mode-helpers for older versions
-        files = find_file("permissions-mode-helpers-*.js",
-                          search_keywords=["authMethod", "models.some"])
+    print("\n[模块 1] Fast 模式 — service tier / fast_mode")
+    files = []
+    for pattern, keywords in [
+        ("use-is-fast-mode-enabled-*.js", ["authMethod", "canUseFastMode"]),
+        ("permissions-mode-helpers-*.js", ["authMethod", "models.some"]),
+        ("use-service-tier-settings-*.js", ["fast_mode", "authMethod"]),
+        ("read-service-tier-for-request-*.js", ["fast_mode", "authMethod"]),
+    ]:
+        for f in find_file(pattern, search_keywords=keywords):
+            if f not in files:
+                files.append(f)
     if not files:
         print("  [FAIL] 未找到 Fast 模式文件")
         return
 
     for filepath in files:
+        basename = os.path.basename(filepath)
+        if basename.startswith("use-service-tier-settings-"):
+            apply_patch(filepath,
+                name="Fast 授权门控（新版 service tier）",
+                find_str="a=i?.authMethod===`chatgpt`",
+                replace_str="a=i?.authMethod===`chatgpt`||i?.authMethod===`apikey`",
+                find_regex=r'([a-zA-Z_$]+)=([a-zA-Z_$]+)\?\.authMethod===`chatgpt`',
+                replace_fn=lambda m: f"{m.group(1)}={m.group(2)}?.authMethod===`chatgpt`||{m.group(2)}?.authMethod===`apikey`"
+            )
+            apply_patch(filepath,
+                name="Fast feature requirement 宽松通过",
+                find_str="c?.requirements?.featureRequirements?.fast_mode!==!1",
+                replace_str="/*__codex_boji_fast_feature__*/true",
+                find_regex=r'[a-zA-Z_$]+\?\.requirements\?\.featureRequirements\?\.fast_mode!==!1',
+                replace_fn=lambda m: "/*__codex_boji_fast_feature__*/true",
+                applied_marker=r'__codex_boji_fast_feature__'
+            )
+            continue
+        if basename.startswith("read-service-tier-for-request-"):
+            apply_patch(filepath,
+                name="Fast 请求门控（新版 request）",
+                find_str="return n===`chatgpt`?(await e.query.fetch(c,{authMethod:n,hostId:t})).requirements?.featureRequirements?.fast_mode!==!1:!1",
+                replace_str="return/*__codex_boji_fast_request__*/n===`chatgpt`||n===`apikey`?!0:!1",
+                find_regex=r'return\s+([a-zA-Z_$]+)===`chatgpt`\?\(await [^;]+?fast_mode!==!1:!1',
+                replace_fn=lambda m: f"return/*__codex_boji_fast_request__*/{m.group(1)}===`chatgpt`||{m.group(1)}===`apikey`?!0:!1",
+                applied_marker=r'__codex_boji_fast_request__'
+            )
+            continue
+
         # 补丁 1a: Fast 授权门控 — g(e) 函数
         # 新版 Codex: return!(c?.authMethod!==`chatgpt`||u)
         # 旧版 Codex: return!(r?.authMethod!==`chatgpt`||a)
@@ -533,15 +1127,35 @@ def patch_module_2_plugins_i18n():
     print("\n[模块 2] 插件侧边栏 + i18n — app-main-*.js")
     files = find_file("app-main-*.js",
                       search_keywords=["pluginsDisabledTooltip", "enable_i18n"])
+    plugin_files = [f for f in files if file_contains(f, "pluginsDisabledTooltip")]
+    plugin_new_files = []
+    if not plugin_files:
+        plugin_new_files = find_file("use-is-plugins-enabled-*.js",
+                                     search_keywords=["plugins", "experimental-features"])
+    if not plugin_files and not plugin_new_files:
+        plugin_files = find_file("use-is-plugins-enabled-*.js",
+                                 search_keywords=["plugins", "experimental-features"])
+    i18n_files = []
+    for f in (
+        files
+        + find_asset_files_containing("*.js", "__codex_boji_i18n__")
+        + find_asset_files_containing("*.js", "enable_i18n")
+    ):
+        if f not in i18n_files and (
+            file_contains(f, "__codex_boji_i18n__")
+            or file_contains(f, "enable_i18n")
+        ):
+            i18n_files.append(f)
     if not files:
-        print("  [FAIL] 未找到 app-main-*.js")
-        return
+        if not plugin_files and not plugin_new_files and not i18n_files:
+            print("  [FAIL] 未找到 app-main-*.js")
+            return
 
-    for filepath in files:
+    for filepath in plugin_files:
         # 补丁 2a: 插件侧边栏 — 门控变量 → 0
         # 新版: d?(0,$.jsx)(eo,{tooltipContent:...
         # 旧版: X?(0,$.jsx)(组件,{tooltipContent:...
-        apply_patch(filepath,
+        result = apply_patch(filepath,
             name="插件侧边栏解锁",
             find_str=None,
             replace_str=None,
@@ -551,17 +1165,44 @@ def patch_module_2_plugins_i18n():
             applied_marker=r'0\?\(0,\$\.jsx\)\([a-zA-Z_$]+,\{tooltipContent:\(0,\$\.jsx\)\([a-zA-Z_$]+,\{id:`sidebarElectron\.pluginsDisabledTooltip`'
         )
 
+    for filepath in plugin_new_files:
+        apply_patch(filepath,
+            name="插件侧边栏解锁（新版 feature gate）",
+            find_str="c?.enabled??!0",
+            replace_str="/*__codex_boji_plugins_enabled__*/true",
+            find_regex=r'[a-zA-Z_$]+\?\.enabled\?\?!0',
+            replace_fn=lambda m: "/*__codex_boji_plugins_enabled__*/true",
+            applied_marker=r'__codex_boji_plugins_enabled__'
+        )
+
+    for filepath in i18n_files:
         # 补丁 2b: i18n 多语言强制启用
         # Statsig 实验门控在无用户上下文时返回 false
-        apply_patch(filepath,
-            name="i18n 多语言强制启用",
-            find_str=None,
-            replace_str=None,
-            find_regex=r'([a-zA-Z_$])=\(0,([a-zA-Z_$]+)\.useMemo\)\(\(\)=>[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\),\[([a-zA-Z_$]+)\]\)',
-            replace_fn=lambda m: f"{m.group(1)}=(0,{m.group(2)}.useMemo)(()=>!0,[{m.group(3)}])",
-            # 补丁后形态：useMemo 直接返回 !0，且原 enable_i18n 取值已被移除
-            applied_marker=r'=\(0,[a-zA-Z_$]+\.useMemo\)\(\(\)=>!0,\[[a-zA-Z_$]+\]\)'
-        )
+        if file_contains(filepath, "__codex_boji_i18n__"):
+            mark_skipped("i18n 多语言强制启用", "已应用", filepath)
+        elif file_contains(filepath, "?.get(`enable_i18n`,!1)"):
+            apply_patch(filepath,
+                name="i18n 多语言强制启用（新版 Statsig）",
+                find_str="s=a?.get(`enable_i18n`,!1)",
+                replace_str="s=/*__codex_boji_i18n__*/!0",
+                find_regex=r'([a-zA-Z_$]+)=([a-zA-Z_$]+)\?\.get\(`enable_i18n`,!1\)',
+                replace_fn=lambda m: f"{m.group(1)}=/*__codex_boji_i18n__*/!0",
+                applied_marker=r'__codex_boji_i18n__'
+            )
+        elif file_contains(filepath, "?.get(`enable_i18n`,!0)"):
+            mark_skipped("i18n 多语言强制启用", "当前文件默认已启用", filepath)
+        else:
+            apply_patch(filepath,
+                name="i18n 多语言强制启用",
+                find_str=None,
+                replace_str=None,
+                find_regex=r'([a-zA-Z_$])=\(0,([a-zA-Z_$]+)\.useMemo\)\(\(\)=>[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\),\[([a-zA-Z_$]+)\]\)',
+                replace_fn=lambda m: f"{m.group(1)}=(0,{m.group(2)}.useMemo)(()=>!0,[{m.group(3)}])",
+                # 补丁后形态：useMemo 直接返回 !0，且原 enable_i18n 取值已被移除
+                applied_marker=r'=\(0,[a-zA-Z_$]+\.useMemo\)\(\(\)=>!0,\[[a-zA-Z_$]+\]\)'
+            )
+    if not i18n_files:
+        mark_skipped("i18n 多语言强制启用", "当前版本无 enable_i18n 门控")
 
 
 # ================================================================
@@ -597,6 +1238,7 @@ def patch_module_4_brand():
     if not files:
         files = find_file("gradient-*.js",
                           search_keywords=["return e!==`chatgpt`", "function e(e){return e!==`chatgpt`}"])
+    files = [f for f in files if file_contains(f, "!==`chatgpt`")]
     if not files:
         print("  品牌视觉检查可能已迁移，搜索所有 JS...")
         for f in glob.glob(os.path.join(BASE, "*.js")):
@@ -610,7 +1252,7 @@ def patch_module_4_brand():
             except:
                 pass
         if not files:
-            print("  [SKIP] 当前版本无品牌视觉门控，跳过")
+            mark_skipped("品牌视觉统一", "当前版本无品牌视觉门控")
             return
 
     for filepath in files:
@@ -675,7 +1317,7 @@ def fetch_user_models():
     global API_BASE_URL, API_KEY
     
     # 尝试从 auth.json 读取 API Key
-    auth_json_path = os.path.join(USER_HOME, ".codex", "auth.json")
+    auth_json_path = os.path.join(CODEX_HOME, "auth.json")
     if os.path.exists(auth_json_path):
         try:
             with open(auth_json_path, "r", encoding="utf-8") as f:
@@ -739,11 +1381,14 @@ def fetch_user_models():
 # 模块 7: 前端模型克隆注入 — model-queries-*.js
 # ================================================================
 def patch_module_7_frontend_models():
-    print("\n[模块 7] 前端模型克隆注入 — model-queries-*.js")
-    files = find_file("model-queries-*.js",
-                      search_keywords=["select:({data:r})", "gpt-5.5"])
+    print("\n[模块 7] 前端模型克隆注入 — model-queries / models-and-reasoning-efforts")
+    files = find_file("models-and-reasoning-efforts-*.js",
+                      search_keywords=["defaultModel", "useHiddenModels"])
     if not files:
-        print("  [FAIL] 未找到 model-queries-*.js")
+        files = find_file("model-queries-*.js",
+                          search_keywords=["list-models-for-host", "defaultModel"])
+    if not files:
+        print("  [FAIL] 未找到模型前端处理文件")
         return
 
     models_to_inject = fetch_user_models()
@@ -775,9 +1420,35 @@ def patch_module_7_frontend_models():
         # 精准幂等性检查
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
-        if "extraModels" in content:
+        if "__codex_boji_extra_models__" in content or "extraModels" in content:
             results["skipped"].append(f"{basename}: 前端动态模型克隆注入")
             print(f"  [SKIP] 前端动态模型克隆注入 — 已应用")
+            continue
+
+        if basename.startswith("models-and-reasoning-efforts-"):
+            new_func = (
+                "function e({authMethod:e,availableModels:t,defaultModel:n,models:r,useHiddenModels:i})"
+                "{let a=[],o=null,s=i&&e!==`amazonBedrock`;r.forEach(n=>{if(s?t.has(n.model):!n.hidden)"
+                "{let t=e===`copilot`?[n.supportedReasoningEfforts.find(e=>e.reasoningEffort===`medium`)??"
+                "{reasoningEffort:`medium`,description:`medium effort`}]:[...n.supportedReasoningEfforts];"
+                "a.push({...n,hidden:false,supportedReasoningEfforts:t}),n.isDefault&&(o=n)}});"
+                f"const __codex_boji_extra_models__={js_array_str},__codex_boji_template__=a[0];"
+                "__codex_boji_template__&&__codex_boji_extra_models__.forEach(e=>{"
+                "if(!a.some(t=>t.model===e||t.id===e||t.slug===e)){let n={...__codex_boji_template__};"
+                "for(let r in n)typeof n[r]===`string`&&(n[r]===__codex_boji_template__.model||n[r]===__codex_boji_template__.id||n[r]===__codex_boji_template__.slug?"
+                "n[r]=e:(n[r]===__codex_boji_template__.displayName||n[r]===__codex_boji_template__.display_name)&&(n[r]=e.replace(/-/g,\" \").replace(/\\b\\w/g,c=>c.toUpperCase())));"
+                "n.model=e,n.id=e,n.slug=e,n.display_name=e.replace(/-/g,\" \").replace(/\\b\\w/g,c=>c.toUpperCase()),"
+                "n.displayName=n.display_name,n.hidden=false,n.isDefault=false,a.push(n)}});"
+                "o??=a.find(e=>e.model===n||e.id===n||e.slug===n)??null;return{models:a,defaultModel:o}}"
+            )
+            apply_patch(filepath,
+                name="前端动态模型克隆注入（新版模型处理）",
+                find_str=None,
+                replace_str=None,
+                find_regex=r'function\s+e\(\{authMethod:e,availableModels:t,defaultModel:n,models:r,useHiddenModels:i\}\)\{.*?\{models:a,defaultModel:o\}\}',
+                replace_fn=lambda m: new_func,
+                applied_marker=r'__codex_boji_extra_models__'
+            )
             continue
 
         apply_patch(filepath,
@@ -790,11 +1461,40 @@ def patch_module_7_frontend_models():
 
 
 # ================================================================
+# 模块 8: 清理旧版状态栏实验残留
+# ================================================================
+def cleanup_legacy_status_injection():
+    """Remove abandoned experimental status UI snippets from older builds."""
+    print("\n[模块 8] 清理旧版状态栏残留")
+    targets = [
+        (find_build_file("main-*.js", search_keywords=["codex_boji:usage-summary"]),
+         "旧版状态栏 main IPC", "__codex_boji_usage_summary_ipc__"),
+        (find_build_file("preload.js", search_keywords=["codexBojiBridge"]),
+         "旧版状态栏 preload bridge", "__codex_boji_usage_summary_preload__"),
+        (find_file("local-conversation-thread-*.js", search_keywords=["__codex_boji_context_hud__"]),
+         "旧版状态栏 UI", "__codex_boji_context_hud__"),
+    ]
+    removed = 0
+    for files, name, marker in targets:
+        for filepath in files:
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    if marker not in f.read():
+                        continue
+                if remove_js_once(filepath, name, marker):
+                    removed += 1
+            except OSError:
+                continue
+    if removed == 0:
+        print("  [OK]   未发现旧版状态栏残留")
+
+
+# ================================================================
 # 模型注入: 从中转站拉取模型列表，注入 models_cache.json
 # ================================================================
 def inject_models():
     """从中转站 /v1/models 拉取模型，补充到 Codex 模型列表"""
-    print("\n[模块 7] 模型下拉注入")
+    print("\n[模块 9] 模型下拉注入")
 
     if not API_BASE_URL or not API_KEY:
         print("  [SKIP] 未检测到中转站配置，跳过模型注入")
@@ -880,7 +1580,7 @@ def inject_models():
 # ================================================================
 def patch_config():
     """补全 features 配置"""
-    print("\n[模块 8] 补全 config.toml")
+    print("\n[模块 10] 补全 config.toml")
     if not os.path.exists(CONFIG_PATH):
         print("  [SKIP] config.toml 不存在")
         return
@@ -920,6 +1620,187 @@ def patch_config():
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         f.write(content)
     print(f"  已备份: {bak}")
+
+
+# ================================================================
+# 本地会话加载: 重建 session_index.jsonl
+# ================================================================
+def _extract_text_from_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(item, str):
+                parts.append(item)
+        return " ".join(parts)
+    return ""
+
+
+def _title_from_message(text):
+    text = re.sub(r"<environment_context>.*?</environment_context>", " ", text or "", flags=re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+    return text[:60]
+
+
+def _parse_session_file(path):
+    session_id = None
+    created_at = None
+    updated_at = None
+    title = None
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                timestamp = obj.get("timestamp")
+                if isinstance(timestamp, str):
+                    updated_at = timestamp
+                    if not created_at:
+                        created_at = timestamp
+
+                payload = obj.get("payload")
+                if obj.get("type") == "session_meta" and isinstance(payload, dict):
+                    if isinstance(payload.get("id"), str):
+                        session_id = payload["id"]
+                    if isinstance(payload.get("timestamp"), str):
+                        created_at = payload["timestamp"]
+                        updated_at = updated_at or payload["timestamp"]
+                    continue
+
+                if title or not isinstance(payload, dict):
+                    continue
+
+                if payload.get("type") == "user_message":
+                    title = _title_from_message(payload.get("message"))
+                elif payload.get("type") == "message" and payload.get("role") == "user":
+                    title = _title_from_message(_extract_text_from_content(payload.get("content")))
+    except OSError:
+        return None
+
+    if not session_id:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        m = re.search(r"(019[a-z0-9-]{32,})", stem)
+        session_id = m.group(1) if m else stem
+
+    if not updated_at:
+        updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(path)))
+
+    if not title:
+        title = f"Local session {session_id[:8]}"
+
+    return {
+        "id": session_id,
+        "thread_name": title,
+        "updated_at": updated_at,
+    }
+
+
+def _iter_local_session_files():
+    for base in (SESSIONS_DIR, ARCHIVED_SESSIONS_DIR):
+        if not os.path.isdir(base):
+            continue
+        for root, _, files in os.walk(base):
+            for name in files:
+                if name.endswith(".jsonl"):
+                    yield os.path.join(root, name)
+
+
+def rebuild_local_session_index():
+    """Merge every local session file into CODEX_HOME/session_index.jsonl."""
+    print("\n[模块 11] 加载本地会话")
+
+    codex_home = os.path.dirname(SESSION_INDEX)
+    if not os.path.isdir(codex_home):
+        print(f"  [SKIP] Codex 配置目录不存在: {codex_home}")
+        return
+
+    existing = {}
+    existing_order = []
+    bad_lines = 0
+    if os.path.exists(SESSION_INDEX):
+        with open(SESSION_INDEX, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    bad_lines += 1
+                    continue
+                session_id = item.get("id")
+                if not isinstance(session_id, str) or not session_id:
+                    bad_lines += 1
+                    continue
+                if session_id not in existing:
+                    existing_order.append(session_id)
+                existing[session_id] = {
+                    "id": session_id,
+                    "thread_name": item.get("thread_name") or f"Local session {session_id[:8]}",
+                    "updated_at": item.get("updated_at") or "",
+                }
+
+    discovered = []
+    for path in _iter_local_session_files():
+        item = _parse_session_file(path)
+        if item:
+            discovered.append(item)
+
+    if not discovered:
+        print("  [SKIP] 未找到本地会话文件")
+        return
+
+    added = 0
+    refreshed = 0
+    for item in discovered:
+        session_id = item["id"]
+        if session_id not in existing:
+            existing_order.append(session_id)
+            existing[session_id] = item
+            added += 1
+            continue
+        # 保留已有标题；只在本地文件更新时间更晚时刷新 updated_at。
+        old = existing[session_id]
+        if item.get("updated_at", "") > old.get("updated_at", ""):
+            old["updated_at"] = item["updated_at"]
+            refreshed += 1
+
+    if added == 0 and refreshed == 0 and bad_lines == 0:
+        print(f"  [SKIP] 会话索引已完整，本地会话: {len(discovered)} 个")
+        return
+
+    if os.path.exists(SESSION_INDEX):
+        bak = SESSION_INDEX + ".bak"
+        shutil.copy2(SESSION_INDEX, bak)
+        print(f"  已备份: {bak}")
+
+    items = [existing[sid] for sid in existing_order if sid in existing]
+    items.sort(key=lambda x: x.get("updated_at") or "", reverse=False)
+
+    with open(SESSION_INDEX, "w", encoding="utf-8", newline="\n") as f:
+        for item in items:
+            f.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    print(f"  扫描本地会话: {len(discovered)} 个")
+    print(f"  新增索引: {added} 个")
+    if refreshed:
+        print(f"  更新时间: {refreshed} 个")
+    if bad_lines:
+        print(f"  清理异常索引行: {bad_lines} 行")
 
 
 # ================================================================
@@ -999,15 +1880,31 @@ def _restore_files_from_backup(file_paths):
             return 0
         count = 0
         for fp in file_paths:
-            # 在解包目录里按相对 webview/assets 路径找原始文件
-            rel = os.path.relpath(fp, BASE)  # 文件名
-            orig = os.path.join(extract_dir, "webview", "assets", rel)
-            if os.path.isfile(orig):
-                shutil.copyfile(orig, fp)
-                count += 1
+            candidates = []
+            if BASE and _path_is_within(fp, BASE):
+                rel = os.path.relpath(fp, BASE)
+                candidates.append(os.path.join(extract_dir, "webview", "assets", rel))
+            app_dir = os.path.join(CODEX_RESOURCES, "app")
+            if _path_is_within(fp, app_dir):
+                rel = os.path.relpath(fp, app_dir)
+                candidates.append(os.path.join(extract_dir, rel))
+            for orig in candidates:
+                if os.path.isfile(orig):
+                    shutil.copyfile(orig, fp)
+                    count += 1
+                    break
         return count
     finally:
         shutil.rmtree(extract_dir, ignore_errors=True)
+
+
+def _path_is_within(path, root):
+    try:
+        path_abs = os.path.abspath(path)
+        root_abs = os.path.abspath(root)
+        return os.path.commonpath([path_abs, root_abs]) == root_abs
+    except (OSError, ValueError):
+        return False
 
 
 def _write_fuse(value, retries=4, delay=1.5):
@@ -1042,20 +1939,342 @@ def _write_fuse(value, retries=4, delay=1.5):
     return False, last_err
 
 
+def _is_unsupported_fuse_error(err):
+    return bool(err) and (
+        "Could not find sentinel" in err
+        or "fuses are only supported in Electron 12 and higher" in err
+    )
+
+
+def _split_rel_path(rel):
+    return [p for p in re.split(r"[\\/]+", rel.strip("\\/")) if p]
+
+
+def _app_package_main(app_dir):
+    package_json = os.path.join(app_dir, "package.json")
+    try:
+        with open(package_json, "r", encoding="utf-8") as f:
+            main_entry = json.load(f).get("main")
+        if isinstance(main_entry, str) and main_entry.strip():
+            return main_entry.strip()
+    except Exception:
+        pass
+    return ".vite/build/bootstrap.js"
+
+
+def _app_dir_is_complete(app_dir):
+    if not os.path.isdir(app_dir):
+        return False
+
+    main_entry = _app_package_main(app_dir)
+    required = [
+        os.path.join(app_dir, "package.json"),
+        os.path.join(app_dir, *_split_rel_path(main_entry)),
+        os.path.join(app_dir, "webview", "assets"),
+    ]
+    assets_dir = os.path.join(app_dir, "webview", "assets")
+    has_app_main = bool(glob.glob(os.path.join(assets_dir, "app-main-*.js")))
+    return all(os.path.exists(p) for p in required) and has_app_main
+
+
+def _extract_asar_to_app(asar_path, app_dir):
+    if not os.path.isfile(asar_path):
+        print(f"  [WARN] 解包源不存在: {asar_path}")
+        return False
+    if not resolve_executable("npx"):
+        print("[ERROR] 未找到 npx，请先安装 Node.js: https://nodejs.org")
+        return False
+
+    if os.path.isdir(app_dir):
+        _remove_tree_robust(app_dir)
+    print(f"\n[准备] 提取 {os.path.basename(asar_path)}...")
+
+    # @electron/asar resolves unpacked files from "<archive>.unpacked". After
+    # the original archive has been renamed to app.asar1, that would become
+    # app.asar1.unpacked, but Electron packages keep them in app.asar.unpacked.
+    # Use a temporary hard/copy named app.asar so extraction can see the normal
+    # unpacked directory without renaming the user's original backup.
+    extract_source = asar_path
+    temp_extract_source = None
+    normal_asar = os.path.join(os.path.dirname(asar_path), "app.asar")
+    if os.path.basename(asar_path).lower() != "app.asar":
+        temp_extract_source = normal_asar + ".extract"
+        temp_unpacked = temp_extract_source + ".unpacked"
+        try:
+            if os.path.exists(temp_extract_source):
+                os.remove(temp_extract_source)
+            if os.path.isdir(temp_unpacked):
+                _remove_tree_robust(temp_unpacked)
+            elif os.path.exists(temp_unpacked):
+                os.remove(temp_unpacked)
+            shutil.copy2(asar_path, temp_extract_source)
+            unpacked = _asar_unpacked_path(asar_path)
+            backup_unpacked = os.path.join(os.path.dirname(asar_path), "app.asar.unpacked.bak")
+            normal_unpacked = normal_asar + ".unpacked"
+            if os.path.isdir(unpacked):
+                _copy_tree_robust(unpacked, temp_unpacked)
+            elif os.path.isdir(backup_unpacked):
+                _copy_tree_robust(backup_unpacked, temp_unpacked)
+            elif os.path.isdir(normal_unpacked):
+                # Junctions would be nicer, but copying avoids extra shell
+                # quoting and works on machines without Developer Mode.
+                _copy_tree_robust(normal_unpacked, temp_unpacked)
+            extract_source = temp_extract_source
+        except Exception as e:
+            if os.path.exists(temp_extract_source):
+                try:
+                    os.remove(temp_extract_source)
+                except OSError:
+                    pass
+            if os.path.isdir(temp_unpacked):
+                _remove_tree_robust(temp_unpacked)
+            print(f"  [ERROR] 无法准备临时解包源: {e}")
+            return False
+
+    result = run_command(
+        ["npx", "-y", "@electron/asar", "e", extract_source, app_dir],
+        capture_output=True, text=True, timeout=300
+    )
+    if temp_extract_source:
+        try:
+            if os.path.exists(temp_extract_source):
+                os.remove(temp_extract_source)
+            temp_unpacked = temp_extract_source + ".unpacked"
+            if os.path.isdir(temp_unpacked):
+                _remove_tree_robust(temp_unpacked)
+        except OSError:
+            pass
+    if result.returncode != 0:
+        print(f"[ERROR] 提取失败:\n{result.stderr}")
+        return False
+    if not _app_dir_is_complete(app_dir):
+        print("  [ERROR] 提取后的 app/ 不完整，缺少 package.json、.vite/build 或 webview/assets")
+        return False
+    print("  提取完成")
+    return True
+
+
+def prepare_app_dir():
+    """Ensure CODEX_RESOURCES/app is a complete, clean extraction source.
+
+    Prefer app.asar1/app.asar.bak once they exist, because app.asar may be the
+    repacked patched archive from a previous run. If that repacked archive was
+    bad, extracting from it would preserve the corruption.
+    """
+    asar_path = os.path.join(CODEX_RESOURCES, "app.asar")
+    asar1_path = os.path.join(CODEX_RESOURCES, "app.asar1")
+    asar_bak = os.path.join(CODEX_RESOURCES, "app.asar.bak")
+    app_dir = os.path.join(CODEX_RESOURCES, "app")
+
+    if not any(os.path.exists(p) for p in (asar_path, asar1_path, asar_bak)):
+        print(f"\n[ERROR] 未找到 app.asar、app.asar1 或 app.asar.bak: {CODEX_RESOURCES}")
+        print("  请确认 Codex 已正确安装。")
+        return False
+
+    if os.path.exists(asar_path) and not os.path.exists(asar1_path):
+        os.rename(asar_path, asar1_path)
+        print("  已重命名 app.asar -> app.asar1")
+
+    pristine_asar = asar1_path if os.path.exists(asar1_path) else asar_bak
+
+    if _app_dir_is_complete(app_dir):
+        return True
+
+    # If app/ is missing or incomplete, never trust the current app.asar when a
+    # pristine archive exists.
+    if pristine_asar and os.path.exists(pristine_asar):
+        return _extract_asar_to_app(pristine_asar, app_dir)
+
+    return _extract_asar_to_app(asar_path, app_dir)
+
+
+def audit_packed_app():
+    print("\n[校验] app.asar 启动结构检查")
+
+    if not CODEX_RESOURCES:
+        print("  [FAIL] 未定位 resources 目录")
+        return False
+
+    asar_path = os.path.join(CODEX_RESOURCES, "app.asar")
+    unpacked_dir = asar_path + ".unpacked"
+    app_dir = os.path.join(CODEX_RESOURCES, "app")
+    main_entry = _app_package_main(app_dir)
+    required_entries = [
+        ("package.json", "package.json", "entry"),
+        (main_entry.replace("/", "\\"), main_entry, "entry"),
+        ("webview\\assets", "webview\\assets", "tree"),
+        ("webview\\assets\\app-main-*", "webview\\assets\\app-main", "prefix"),
+        ("node_modules\\better-sqlite3\\lib\\database.js", "node_modules\\better-sqlite3\\lib\\database.js", "entry"),
+        ("node_modules\\better-sqlite3\\build\\Release\\better_sqlite3.node", "node_modules\\better-sqlite3\\build\\Release\\better_sqlite3.node", "unpacked"),
+        ("node_modules\\node-pty\\lib\\index.js", "node_modules\\node-pty\\lib\\index.js", "entry"),
+        ("node_modules\\node-pty\\build\\Release\\pty.node", "node_modules\\node-pty\\build\\Release\\pty.node", "unpacked"),
+        ("node_modules\\node-pty\\build\\Release\\winpty.dll", "node_modules\\node-pty\\build\\Release\\winpty.dll", "unpacked"),
+        ("node_modules\\node-pty\\build\\Release\\winpty-agent.exe", "node_modules\\node-pty\\build\\Release\\winpty-agent.exe", "unpacked"),
+        ("node_modules\\@worklouder\\device-kit-oai\\node_modules\\@worklouder\\wl-device-kit\\node_modules\\node-hid\\build\\Release\\HID.node", "node_modules\\@worklouder\\device-kit-oai\\node_modules\\@worklouder\\wl-device-kit\\node_modules\\node-hid\\build\\Release\\HID.node", "unpacked"),
+    ]
+
+    if not os.path.isfile(asar_path):
+        print(f"  [FAIL] 缺少 app.asar: {asar_path}")
+        return False
+    if not resolve_executable("npx"):
+        print("  [WARN] 未找到 npx，跳过 app.asar 内容检查")
+        return True
+
+    try:
+        r = run_command(["npx", "-y", "@electron/asar", "l", asar_path],
+                        capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        print(f"  [FAIL] app.asar 列表读取失败: {e}")
+        return False
+    if r.returncode != 0:
+        print(f"  [FAIL] app.asar 列表读取失败: {(r.stderr or '').strip()}")
+        return False
+
+    entries = set(line.strip().lstrip("\\/") for line in r.stdout.splitlines() if line.strip())
+    ok = True
+    for label, rel, mode in required_entries:
+        rel_norm = rel.replace("/", "\\").strip("\\/")
+        if mode == "prefix":
+            in_asar = any(e == rel_norm or e.startswith(rel_norm) for e in entries)
+        elif mode == "tree":
+            in_asar = rel_norm in entries or any(e.startswith(rel_norm + "\\") for e in entries)
+        else:
+            in_asar = rel_norm in entries
+        in_unpacked = os.path.exists(os.path.join(unpacked_dir, *_split_rel_path(rel_norm)))
+        exists = in_asar or in_unpacked
+        if mode == "unpacked":
+            exists = in_unpacked
+        print(f"  [{'OK' if exists else 'FAIL'}] {label}")
+        ok = ok and exists
+    return ok
+
+
+def repack_patched_asar():
+    """Pack the patched app/ directory back into app.asar.
+
+    Newer Codex/Electron shells may keep OnlyLoadAppFromAsar enabled or may not
+    expose writable fuses. Keeping a patched app.asar lets Codex start through
+    the normal production path instead of relying on Electron loading app/.
+    """
+    print("\n[模块 12] 重新打包 app.asar")
+
+    if not CODEX_RESOURCES:
+        print("  [WARN] 未定位到 resources 目录，跳过 app.asar 打包。")
+        return False
+
+    app_dir = os.path.join(CODEX_RESOURCES, "app")
+    asar_path = os.path.join(CODEX_RESOURCES, "app.asar")
+    tmp_asar = asar_path + ".tmp"
+    unpacked_dir = asar_path + ".unpacked"
+    tmp_unpacked_dir = tmp_asar + ".unpacked"
+
+    if not _app_dir_is_complete(app_dir):
+        print(f"  [WARN] app/ 目录不完整，跳过打包: {app_dir}")
+        return False
+
+    if not resolve_executable("npx"):
+        print("  [WARN] 未找到 npx，无法重新打包 app.asar。")
+        print("         Codex 可能会显示 Electron 默认页，请安装 Node.js 后重跑。")
+        return False
+
+    for tmp_path in (tmp_asar, tmp_unpacked_dir):
+        try:
+            if os.path.isdir(tmp_path):
+                _remove_tree_robust(tmp_path)
+            elif os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError as e:
+            print(f"  [WARN] 无法删除旧临时文件: {e}")
+            return False
+
+    try:
+        result = run_command(
+            [
+                "npx", "-y", "@electron/asar", "pack",
+                "--unpack-dir", "node_modules/{@worklouder,better-sqlite3,node-pty}",
+                app_dir,
+                tmp_asar,
+            ],
+            capture_output=True, text=True, timeout=300
+        )
+    except Exception as e:
+        print(f"  [WARN] app.asar 打包异常: {e}")
+        return False
+
+    if result.returncode != 0:
+        print("  [WARN] app.asar 打包失败")
+        err = (result.stderr or result.stdout or "").strip()
+        if err:
+            print(f"         {err.splitlines()[-1] if err.splitlines() else err}")
+        try:
+            if os.path.exists(tmp_asar):
+                os.remove(tmp_asar)
+        except OSError:
+            pass
+        return False
+
+    try:
+        _replace_file_retry(tmp_asar, asar_path)
+        if os.path.isdir(tmp_unpacked_dir):
+            # Electron derives this path from app.asar. If we leave the
+            # temporary app.asar.tmp.unpacked directory in place, native
+            # modules such as better-sqlite3 resolve against stale files.
+            _replace_tree_retry(tmp_unpacked_dir, unpacked_dir, CODEX_RESOURCES)
+    except OSError as e:
+        print(f"  [WARN] 无法替换 app.asar: {e}")
+        return False
+
+    print(f"  [OK]   已生成补丁版 app.asar: {asar_path}")
+    if os.path.isdir(unpacked_dir):
+        print(f"  [OK]   已同步原生模块目录: {unpacked_dir}")
+    return True
+
+
+def _codesign_macos():
+    if PLATFORM != "macos":
+        return
+
+    print("\n[模块 14] macOS 重新签名")
+    if not resolve_executable("codesign"):
+        print("  [WARN] 未找到 codesign（需要 Xcode Command Line Tools），跳过。")
+        return
+    try:
+        r = run_command(
+            ["codesign", "--force", "--deep", "--sign", "-", CODEX_APP],
+            capture_output=True, text=True, timeout=180
+        )
+        if r.returncode == 0:
+            print(f"  [OK]   已重新签名 {CODEX_APP}")
+        else:
+            print(f"  [WARN] 重新签名失败: {r.stderr.strip()}")
+            print("         若 Codex 无法启动，请手动执行:")
+            print(f"         codesign --force --deep --sign - {CODEX_APP}")
+    except Exception as e:
+        print(f"  [WARN] codesign 执行异常: {e}")
+
+
 # ================================================================
 def apply_fuses_and_sign():
     """关闭 Electron 安全熔断器，让 Codex 从解包的 app/ 目录加载修改后的 JS。
     macOS 还需重新签名，否则 Gatekeeper 拒绝启动被修改的应用。
     所有步骤跨平台统一，使 `python patch.py` 在任何机器上都能独立完成补丁。"""
-    print("\n[模块 9] 禁用 Electron 安全熔断器")
+    print("\n[模块 13] 禁用 Electron 安全熔断器")
 
     if not CODEX_APP:
         print("  [WARN] 未定位到 Codex 可执行文件，跳过 fuse 设置。")
         print("         Codex 可能无法加载补丁，请手动执行 @electron/fuses。")
+        _codesign_macos()
+        return
+
+    packed_asar = os.path.join(CODEX_RESOURCES, "app.asar") if CODEX_RESOURCES else None
+    if packed_asar and os.path.isfile(packed_asar):
+        print("  [SKIP] 已生成补丁版 app.asar，不需要依赖解包目录启动")
+        _codesign_macos()
         return
 
     if not resolve_executable("npx"):
         print("  [WARN] 未找到 npx，跳过 fuse 设置。请安装 Node.js 后重跑。")
+        _codesign_macos()
         return
 
     # 写 fuse 前确保 Codex 进程已退出并释放文件句柄
@@ -1073,6 +2292,8 @@ def apply_fuses_and_sign():
         ok, err = _write_fuse(fuse)
         if ok:
             print(f"  [OK]   {fuse}")
+        elif _is_unsupported_fuse_error(err):
+            print(f"  [SKIP] {fuse} — 当前 Codex 外壳不支持 Electron fuse 写入")
         else:
             all_ok = False
             print(f"  [WARN] fuse {fuse} 设置失败（可能需要管理员/sudo 权限）")
@@ -1081,25 +2302,7 @@ def apply_fuses_and_sign():
     if not all_ok:
         print("  [HINT] 若 Codex 启动后补丁未生效，请以管理员/sudo 身份重跑本脚本。")
 
-    # macOS 重新签名
-    if PLATFORM == "macos":
-        print("\n[模块 10] macOS 重新签名")
-        if not resolve_executable("codesign"):
-            print("  [WARN] 未找到 codesign（需要 Xcode Command Line Tools），跳过。")
-            return
-        try:
-            r = run_command(
-                ["codesign", "--force", "--deep", "--sign", "-", CODEX_APP],
-                capture_output=True, text=True, timeout=180
-            )
-            if r.returncode == 0:
-                print(f"  [OK]   已重新签名 {CODEX_APP}")
-            else:
-                print(f"  [WARN] 重新签名失败: {r.stderr.strip()}")
-                print("         若 Codex 无法启动，请手动执行:")
-                print(f"         codesign --force --deep --sign - {CODEX_APP}")
-        except Exception as e:
-            print(f"  [WARN] codesign 执行异常: {e}")
+    _codesign_macos()
 
 
 # ================================================================
@@ -1178,57 +2381,340 @@ def check_prerequisites():
     return False
 
 
-def create_desktop_shortcut():
-    """在桌面创建 'Codex (Patched)' 快捷方式，指向补丁版 Codex.exe。
-    仅 Windows 生效（macOS/Linux 用户直接从 Applications 或命令行启动）。
-    使用 PowerShell COM 对象创建 .lnk，不依赖第三方库。"""
-    if sys.platform != "win32" or not CODEX_APP:
-        return
+def _windows_known_folder(name):
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", f"[Environment]::GetFolderPath('{name}')"],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
 
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    if not os.path.isdir(desktop):
-        # 有些系统桌面路径不同，尝试 shell:desktop
-        try:
-            r = subprocess.run(
-                ["powershell", "-Command", "[Environment]::GetFolderPath('Desktop')"],
-                capture_output=True, text=True, timeout=10
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                desktop = r.stdout.strip()
-        except Exception:
-            pass
-    if not os.path.isdir(desktop):
-        return
 
-    shortcut_path = os.path.join(desktop, "Codex (Patched).lnk")
-
-    # 如果快捷方式已存在，跳过
+def _create_windows_shortcut(shortcut_path, label):
+    os.makedirs(os.path.dirname(shortcut_path), exist_ok=True)
     if os.path.isfile(shortcut_path):
-        print(f"\n  桌面快捷方式已存在: Codex (Patched)")
+        print(f"  {label}快捷方式已存在: {WINDOWS_SHORTCUT_NAME}")
         return
 
-    # 用 PowerShell 创建 .lnk 快捷方式
     ps_script = f'''
 $ws = New-Object -ComObject WScript.Shell
 $sc = $ws.CreateShortcut("{shortcut_path}")
 $sc.TargetPath = "{CODEX_APP}"
 $sc.WorkingDirectory = "{os.path.dirname(CODEX_APP)}"
-$sc.Description = "Codex (API Key Patched)"
+$sc.IconLocation = "{CODEX_APP},0"
+$sc.Description = "Codex-boji (API Key Patched)"
 $sc.Save()
+'''
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps_script],
+        capture_output=True, text=True, timeout=15
+    )
+    if r.returncode == 0:
+        print(f"  {label}快捷方式已创建: {WINDOWS_SHORTCUT_NAME}")
+    else:
+        print(f"  [WARN] 创建{label}快捷方式失败: {r.stderr.strip()}")
+        print(f"         你可以手动创建快捷方式指向: {CODEX_APP}")
+
+
+def create_desktop_shortcut():
+    """创建 'Codex-boji' 快捷方式，指向补丁版 Codex.exe。
+    仅 Windows 生效（macOS/Linux 用户直接从 Applications 或命令行启动）。
+    使用 PowerShell COM 对象创建 .lnk，不依赖第三方库。"""
+    if sys.platform != "win32" or not CODEX_APP:
+        return
+
+    targets = []
+    desktop = _windows_known_folder("Desktop") or os.path.join(os.path.expanduser("~"), "Desktop")
+    if desktop:
+        targets.append((os.path.join(desktop, f"{WINDOWS_SHORTCUT_NAME}.lnk"), "桌面"))
+
+    start_menu = _windows_known_folder("StartMenu")
+    if start_menu:
+        targets.append((os.path.join(start_menu, "Programs", f"{WINDOWS_SHORTCUT_NAME}.lnk"), "开始菜单"))
+
+    print()
+    for shortcut_path, label in targets:
+        try:
+            _create_windows_shortcut(shortcut_path, label)
+        except Exception as e:
+            print(f"  [WARN] 创建{label}快捷方式异常: {e}")
+            print(f"         你可以手动创建快捷方式指向: {CODEX_APP}")
+
+
+def _windows_standalone_root():
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if not localappdata:
+        return None
+    preferred = os.path.join(localappdata, WINDOWS_STANDALONE_DIR_NAME)
+    if os.path.isdir(preferred):
+        return preferred
+    for name in WINDOWS_LEGACY_STANDALONE_DIR_NAMES:
+        legacy = os.path.join(localappdata, name)
+        if os.path.isdir(legacy):
+            return legacy
+    return preferred
+
+
+def _windows_preferred_standalone_root():
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if not localappdata:
+        return None
+    return os.path.join(localappdata, WINDOWS_STANDALONE_DIR_NAME)
+
+
+def _windows_all_standalone_roots():
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if not localappdata:
+        return []
+    roots = [os.path.join(localappdata, WINDOWS_STANDALONE_DIR_NAME)]
+    active = _read_active_build_root()
+    if active:
+        roots.append(active)
+    roots.append(os.path.join(localappdata, WINDOWS_STANDALONE_DIR_NAME + ".repair"))
+    roots.extend(os.path.join(localappdata, name) for name in WINDOWS_LEGACY_STANDALONE_DIR_NAMES)
+    seen = set()
+    unique = []
+    for root in roots:
+        norm = os.path.normcase(os.path.abspath(root))
+        if norm not in seen:
+            unique.append(root)
+            seen.add(norm)
+    return unique
+
+
+def _windows_shortcut_paths():
+    """Return shortcut paths created by this project on Windows."""
+    if sys.platform != "win32":
+        return []
+    candidates = []
+    home = os.path.expanduser("~")
+    shortcut_names = [WINDOWS_SHORTCUT_NAME] + WINDOWS_LEGACY_SHORTCUT_NAMES
+    candidates.extend(os.path.join(home, "Desktop", f"{name}.lnk") for name in shortcut_names)
+    appdata = os.environ.get("APPDATA", "")
+    programdata = os.environ.get("PROGRAMDATA", "")
+    if appdata:
+        candidates.extend(os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", f"{name}.lnk") for name in shortcut_names)
+    if programdata:
+        candidates.extend(os.path.join(programdata, "Microsoft", "Windows", "Start Menu", "Programs", f"{name}.lnk") for name in shortcut_names)
+
+    seen = set()
+    unique = []
+    for path in candidates:
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm not in seen:
+            unique.append(path)
+            seen.add(norm)
+    return unique
+
+
+def _shortcut_target(path):
+    if sys.platform != "win32" or not os.path.isfile(path):
+        return None
+    ps = f'''
+$ErrorActionPreference = "Stop"
+$ws = New-Object -ComObject WScript.Shell
+$sc = $ws.CreateShortcut("{path}")
+$sc.TargetPath
 '''
     try:
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_script],
-            capture_output=True, text=True, timeout=15
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=10
         )
         if r.returncode == 0:
-            print(f"\n  桌面快捷方式已创建: Codex (Patched)")
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _remove_windows_shortcuts_for_root(root):
+    removed = []
+    if not root:
+        return removed
+    root_abs = os.path.normcase(os.path.abspath(root))
+    for shortcut in _windows_shortcut_paths():
+        if not os.path.isfile(shortcut):
+            continue
+        target = _shortcut_target(shortcut)
+        if not target:
+            if os.path.splitext(os.path.basename(shortcut))[0] in ([WINDOWS_SHORTCUT_NAME] + WINDOWS_LEGACY_SHORTCUT_NAMES):
+                try:
+                    os.remove(shortcut)
+                    removed.append(shortcut)
+                except OSError as e:
+                    print(f"  [WARN] 删除快捷方式失败: {shortcut} ({e})")
+            continue
+        target_abs = os.path.normcase(os.path.abspath(target))
+        if target_abs.startswith(root_abs + os.sep) or target_abs == os.path.normcase(os.path.abspath(os.path.join(root, "Codex.exe"))):
+            try:
+                os.remove(shortcut)
+                removed.append(shortcut)
+            except OSError as e:
+                print(f"  [WARN] 删除快捷方式失败: {shortcut} ({e})")
+    return removed
+
+
+def _kill_windows_processes_under(root):
+    """Kill only Codex processes whose executable is inside the standalone root."""
+    if sys.platform != "win32" or not root:
+        return 0
+    ps = f'''
+$root = [System.IO.Path]::GetFullPath("{root}").TrimEnd("\\")
+$count = 0
+Get-CimInstance Win32_Process -Filter "name = 'Codex.exe' or name = 'codex.exe'" | ForEach-Object {{
+    if ($_.ExecutablePath) {{
+        $exe = [System.IO.Path]::GetFullPath($_.ExecutablePath)
+        if ($exe.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {{
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            $count += 1
+        }}
+    }}
+}}
+$count
+'''
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=15
+        )
+        if r.returncode == 0 and r.stdout.strip().isdigit():
+            return int(r.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
+
+def uninstall_standalone():
+    """Remove the Windows standalone copy and shortcuts created by this project."""
+    if sys.platform != "win32":
+        print(f"[ERROR] --uninstall 目前只处理 Windows 上自动创建的 {WINDOWS_STANDALONE_DIR_NAME}。")
+        print("        macOS/Linux 请使用 --rollback 后手动删除对应安装目录。")
+        sys.exit(1)
+
+    roots = _windows_all_standalone_roots()
+    if not roots:
+        print(f"[ERROR] 未找到 LOCALAPPDATA，无法定位 {WINDOWS_STANDALONE_DIR_NAME}。")
+        sys.exit(1)
+
+    print("=" * 60)
+    print(f"  {WINDOWS_STANDALONE_DIR_NAME} Uninstall")
+    print("=" * 60)
+
+    any_removed = False
+    all_shortcuts = []
+    for root in roots:
+        print(f"[INFO] 目标目录: {root}")
+
+        killed = _kill_windows_processes_under(root)
+        if killed:
+            print(f"  已关闭补丁版 Codex 进程: {killed}")
+
+        removed_shortcuts = _remove_windows_shortcuts_for_root(root)
+        all_shortcuts.extend(removed_shortcuts)
+        for shortcut in removed_shortcuts:
+            print(f"  已删除快捷方式: {shortcut}")
+
+        root_existed = os.path.isdir(root)
+        if root_existed:
+            exe = os.path.join(root, "Codex.exe")
+            if os.path.isfile(exe):
+                _wait_exe_unlocked(exe, timeout=8.0)
+            try:
+                shutil.rmtree(root)
+                print(f"  已删除目录: {root}")
+                any_removed = True
+            except OSError as e:
+                print(f"  [ERROR] 删除目录失败: {e}")
+                print("          请确认补丁版 Codex 已退出，然后重新运行卸载。")
+                sys.exit(1)
         else:
-            print(f"\n  [WARN] 创建桌面快捷方式失败: {r.stderr.strip()}")
-            print(f"         你可以手动创建快捷方式指向: {CODEX_APP}")
+            print("  目录不存在，跳过。")
+
+    if not all_shortcuts and not any_removed:
+        print("  未发现需要删除的补丁版文件。")
+
+    print("\n卸载完成。官方 Store 版 Codex 不会被删除。")
+
+
+def sync_store_to_boji():
+    """Replace Codex-boji with the current Microsoft Store Codex copy."""
+    if sys.platform != "win32":
+        print(f"[ERROR] --sync-store 目前只支持 Windows 上的 {WINDOWS_STANDALONE_DIR_NAME}。")
+        sys.exit(1)
+
+    try:
+        store = _find_windows_store_codex()
+    except PermissionError:
+        print("\n[INFO] 检测到 Microsoft Store 版 Codex，但无权限读取 WindowsApps 目录。")
+        print("       请以管理员身份运行本脚本。")
+        sys.exit(1)
+
+    if not store:
+        print("[ERROR] 未找到可读取的 Microsoft Store Codex。")
+        sys.exit(1)
+
+    root = _windows_preferred_standalone_root()
+    if not root:
+        print("[ERROR] 未找到 LOCALAPPDATA，无法创建 Codex-boji。")
+        sys.exit(1)
+
+    print("=" * 60)
+    print(f"  Sync Microsoft Store Codex -> {WINDOWS_STANDALONE_DIR_NAME}")
+    print("=" * 60)
+    print(f"[INFO] Store: {store['package_root']}")
+    print(f"[INFO] 目标:  {root}")
+
+    killed = _kill_windows_processes_under(root)
+    if killed:
+        print(f"  已关闭 {WINDOWS_STANDALONE_DIR_NAME} 进程: {killed}")
+
+    backup = None
+    if os.path.isdir(root):
+        backup = root + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+        try:
+            os.rename(root, backup)
+            print(f"  已备份旧版本: {backup}")
+        except OSError as e:
+            print(f"  [ERROR] 备份旧版本失败: {e}")
+            print("          请确认 Codex-boji 已退出，然后重新运行。")
+            sys.exit(1)
+
+    try:
+        print("  正在复制 Store 版文件...")
+        _copy_tree_robust(store["copy_root"], root)
+        _write_boji_manifest(root, store)
+        _check_windows_boji_update(store, root)
+        print("  [OK] 同步完成。")
     except Exception as e:
-        print(f"\n  [WARN] 创建桌面快捷方式异常: {e}")
-        print(f"         你可以手动创建快捷方式指向: {CODEX_APP}")
+        print(f"  [ERROR] 同步失败: {e}")
+        if backup and os.path.isdir(backup) and not os.path.isdir(root):
+            try:
+                os.rename(backup, root)
+                print("  已恢复旧版本。")
+            except OSError as restore_error:
+                print(f"  [WARN] 恢复旧版本失败: {restore_error}")
+        sys.exit(1)
+
+    print(f"\n请继续运行: python patch.py")
+
+
+def print_usage():
+    print("Usage:")
+    print("  python patch.py                 Install or update patched Codex")
+    print("  python patch.py --rollback      Roll back patch files only")
+    print(f"  python patch.py --uninstall     Remove Windows {WINDOWS_STANDALONE_DIR_NAME} and shortcuts")
+    print(f"  python patch.py --sync-store    Sync current Store Codex into {WINDOWS_STANDALONE_DIR_NAME}")
+    print("  python patch.py --load-sessions Rebuild local session index only")
+    print("  python patch.py --path <dir>    Target a non-standard Codex install")
+    print("")
+    print("Environment:")
+    print("  CODEX_PATH=<dir>                Target Codex app/resources directory")
+    print("  CODEX_HOME=<dir>                Target Codex config directory (default: ~/.codex)")
 
 
 def kill_codex():
@@ -1283,45 +2769,13 @@ def main():
     kill_codex()
     load_config()
 
-    # 检查 asar 状态
-    asar_path = os.path.join(CODEX_RESOURCES, "app.asar")
+    # 检查 asar 状态，并从原始包准备完整 app/ 目录
+    if not prepare_app_dir():
+        sys.exit(1)
     asar1_path = os.path.join(CODEX_RESOURCES, "app.asar1")
     app_dir = os.path.join(CODEX_RESOURCES, "app")
-
-    # app.asar1 存在 = 已经打过补丁，可以直接跳到补丁步骤
-    if not os.path.exists(asar_path) and not os.path.exists(asar1_path):
-        print(f"\n[ERROR] 未找到 app.asar 或 app.asar1: {CODEX_RESOURCES}")
-        print("  请确认 Codex 已正确安装。")
-        sys.exit(1)
-
-    # 如果还没提取过
-    if not os.path.isdir(app_dir) or not os.path.exists(os.path.join(app_dir, "webview")):
-        if not os.path.exists(asar_path):
-            print(f"\n[ERROR] app.asar 不存在且 app/ 未就绪，无法继续。")
-            sys.exit(1)
-        print("\n[准备] 提取 app.asar...")
-        if not resolve_executable("npx"):
-            print("[ERROR] 未找到 npx，请先安装 Node.js: https://nodejs.org")
-            sys.exit(1)
-        try:
-            result = run_command(
-                ["npx", "-y", "@electron/asar", "e", asar_path, app_dir],  # -y 防止首次运行时卡在包安装确认
-                capture_output=True, text=True, timeout=120
-            )
-        except FileNotFoundError:
-            print("[ERROR] 无法调用 npx，请确认 Node.js 已正确安装并在 PATH 中。")
-            sys.exit(1)
-        if result.returncode != 0:
-            print(f"[ERROR] 提取失败:\n{result.stderr}")
-            sys.exit(1)
-        print("  提取完成")
-
-    # 重命名 asar（如果还存在）
-    if os.path.exists(asar_path) and not os.path.exists(asar1_path):
-        os.rename(asar_path, asar1_path)
-        print("  已重命名 app.asar -> app.asar1")
-    elif os.path.exists(asar1_path):
-        print("  app.asar1 已存在，跳过重命名")
+    if os.path.exists(asar1_path):
+        print("  app.asar1 已存在，作为原始备份保留")
 
     # 设置全局路径
     BASE = os.path.join(app_dir, "webview", "assets")
@@ -1329,11 +2783,8 @@ def main():
         print(f"[ERROR] webview/assets 不存在: {BASE}")
         sys.exit(1)
 
-    # 备份原始 asar（仅首次）
-    asar_bak = os.path.join(CODEX_RESOURCES, "app.asar.bak")
-    if os.path.exists(asar1_path) and not os.path.exists(asar_bak):
-        shutil.copy2(asar1_path, asar_bak)
-        print(f"  已备份: {asar_bak}")
+    # 备份原始 asar 及其 unpacked sidecar（仅首次）
+    _backup_original_asar_files()
 
     # 执行补丁
     patch_module_0_session_persist()
@@ -1344,6 +2795,7 @@ def main():
     patch_module_5_voice()
     patch_module_6_usage()
     patch_module_7_frontend_models()
+    cleanup_legacy_status_injection()
 
     # 模型注入
     inject_models()
@@ -1351,10 +2803,21 @@ def main():
     # 配置补全
     patch_config()
 
+    # 本地会话索引修复，避免切换 API/账号后历史会话列表缺项
+    rebuild_local_session_index()
+
     # 补丁后语法校验（关键安全网：防止改坏 JS 导致 Codex 卡 logo）
     syntax_ok = validate_patched_syntax()
 
-    # 禁用 Electron 熔断器 + macOS 重新签名（内置，跨平台）
+    # 重新打包 app.asar，避免新版 Electron shell 因 fuse 不可写而进入默认欢迎页
+    packed_ok = repack_patched_asar()
+    audit_ok = audit_packed_app()
+    if not packed_ok or not audit_ok:
+        print("\n[ERROR] 打包后的 Codex 启动结构检查未通过，已停止。")
+        print("        不建议启动 Codex-boji；请把上方 [FAIL] 信息反馈以便修复。")
+        sys.exit(1)
+
+    # 禁用 Electron 熔断器作为兜底 + macOS 重新签名（内置，跨平台）
     apply_fuses_and_sign()
 
     # 报告
@@ -1370,6 +2833,14 @@ def main():
 
     # 创建桌面快捷方式（Windows），方便用户启动补丁版 Codex
     create_desktop_shortcut()
+    if sys.platform == "win32":
+        _write_active_build_root(os.path.dirname(CODEX_APP) if CODEX_APP else os.path.dirname(CODEX_RESOURCES))
+
+    if sys.platform == "win32":
+        status = _check_windows_boji_update()
+        if status and status.get("update_available"):
+            print(f"\n  [UPDATE] Microsoft Store Codex 已更新: {status.get('store_version')} > {status.get('boji_version')}")
+            print(f"           建议同步更新 {WINDOWS_STANDALONE_DIR_NAME} 后重新打补丁。")
 
     print(f"\n  Codex 全功能解锁完成。启动 Codex 使用 API key 模式登录即可。")
     print(f"  如需回滚，运行: python3 patch.py --rollback\n")
@@ -1389,6 +2860,9 @@ def rollback():
         shutil.rmtree(app_dir)
         print("  已删除 app/ 目录")
     if os.path.exists(asar1_path):
+        if os.path.exists(asar_path):
+            os.remove(asar_path)
+            print("  已删除补丁版 app.asar")
         os.rename(asar1_path, asar_path)
         print("  已恢复 app.asar")
     if os.path.exists(asar_bak):
@@ -1456,5 +2930,13 @@ def rollback():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--rollback":
         rollback()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--uninstall":
+        uninstall_standalone()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--sync-store":
+        sync_store_to_boji()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--load-sessions":
+        rebuild_local_session_index()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("--help", "-h", "/?"):
+        print_usage()
     else:
         main()
